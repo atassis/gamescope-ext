@@ -35,7 +35,8 @@ in $conf. In Steam's launch options: $self %command%
 
   -p, --profile NAME   use [NAME] (also GAMESCOPE_EXT_PROFILE)
   -n, --dry-run        print the command line instead of running it
-  --list               show the profiles and the installed plugins
+  --list               show the profiles, and each installed plugin with its configs, scales
+                       and environment switches
   --KEY VALUE          set a profile key for this run, over the config file:
       --output WxH       your screen                   --scale N or N/M   output / game size
       --input WxH        the game's size, not scale    --filter F         a -F value, e.g. fsr,
@@ -130,8 +131,24 @@ if [ $list = 1 ]; then
 		for m in "$d"/*/manifest.json; do
 			[ -f "$m" ] || continue
 			p=$(dirname "$m")
-			data=$(find "$p" -mindepth 1 -maxdepth 1 -type d -printf '%f ' 2>/dev/null)
-			echo "plugin: $(basename "$p")  ($p)${data:+  data: $data}"
+			echo "plugin $(basename "$p")  ($p)"
+			if command -v python3 >/dev/null; then
+				python3 - "$m" <<'PY' || true
+import json, sys
+m = json.load(open(sys.argv[1]))
+if m.get("description"): print("  " + m["description"])
+if m.get("config_help"): print("  config: " + m["config_help"])
+for c in m.get("configs", []):
+    scales = " ".join(c.get("scales", []))
+    print(f"  external:{m.get('name', '?')}:{c['name']}" + (f"  scales {scales}" if scales else "")
+          + (f"  -- {c['description']}" if c.get("description") else ""))
+for k, v in m.get("env", {}).items():
+    print(f"  env {k}: {v}")
+PY
+			else
+				data=$(find "$p" -mindepth 1 -maxdepth 1 -type d -printf '%f ' 2>/dev/null)
+				[ -z "$data" ] || echo "  data: $data"
+			fi
 		done
 	done
 	exit 0
@@ -162,11 +179,33 @@ filter=${cfg[filter]}
 if [[ $filter =~ ^external:([^:/]+):([^/]+)$ ]]; then
 	for d in "${plugin_dirs[@]}"; do
 		if [ -f "$d/${BASH_REMATCH[1]}/manifest.json" ]; then
-			[ -d "$d/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}" ] &&
-				filter="external:${BASH_REMATCH[1]}:$d/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+			manifest=$d/${BASH_REMATCH[1]}/manifest.json
+			config=${BASH_REMATCH[2]}
+			[ -d "$d/${BASH_REMATCH[1]}/$config" ] &&
+				filter="external:${BASH_REMATCH[1]}:$d/${BASH_REMATCH[1]}/$config"
 			break
 		fi
 	done
+fi
+
+# A scale the plugin's manifest does not list for this config is declined at run time, and
+# gamescope then upscales with its own FSR1: say so now rather than only in its log.
+scale=${cfg[scale]}
+if [ -n "${cfg[input]:-}" ]; then
+	# The scale an input size implies, as a reduced fraction, or nothing when the axes differ.
+	a=$out_w; b=$in_w
+	while [ "$b" -ne 0 ]; do t=$((a % b)); a=$b; b=$t; done
+	scale=$((out_w / a))/$((in_w / a))
+	[ $((out_w * in_h)) -eq $((out_h * in_w)) ] || scale=
+	[ "${scale#*/}" != 1 ] || scale=${scale%/1}
+fi
+if [ -n "${manifest:-}" ] && [ -n "$scale" ] && command -v python3 >/dev/null; then
+	listed=$(python3 -c 'import json,sys
+for c in json.load(open(sys.argv[1])).get("configs", []):
+    if c.get("name") == sys.argv[2]: print(" ".join(c.get("scales", [])))' "$manifest" "$config" 2>/dev/null || true)
+	if [ -n "$listed" ] && [[ " $listed " != *" $scale "* ]]; then
+		echo "$self: warning: $config lists scales $listed, not $scale; gamescope will use its own FSR1" >&2
+	fi
 fi
 
 binary=${cfg[binary]:-$exe}

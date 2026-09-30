@@ -15,6 +15,10 @@ A name resolves to `<dir>/<name>/manifest.json` over `$GAMESCOPE_UPSCALER_PATH`,
 wins; a manifest whose `abi_version` differs from the host's is refused. A spec containing `/` is a
 library path. Keys the host reads: `name`, `abi_version`, `library` (relative to the manifest),
 `default_config` (used when the `-F` value carries none), `description`; `device` is for people.
+Three optional keys are for people and for `gamescope-ext-run --list`, and the host ignores them:
+`config_help` (the config string's syntax), `configs` (a list of `{name, description, scales}`, one
+per data directory installed beside the plugin, scales written like `3/2`) and `env` (an object of
+environment variable to what it does).
 
 The host installs `external_upscaler.h` and a `gamescope-external-upscaler` pkg-config file; each
 plugin is its own meson project and builds against either.
