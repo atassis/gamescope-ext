@@ -17,13 +17,23 @@ gamescope without either one loading the other's layer.
 
 Then install the plugins you have hardware for. Plugins are separate projects: each has its own
 installer, which checks for its hardware and builds against the ABI header and pkg-config file
-installed above.
+installed above. [gamescope-ext-plugins](https://github.com/atassis/gamescope-ext-plugins) has a
+reference plugin, FSR1 on a Vulkan device of your choice, and an installer for it and this host.
 
 ### Run
 
     gamescope-ext -w 1280 -h 800 -W 2560 -H 1600 -F external:<plugin>[:config] -- %command%
 
 If a plugin declines the sizes, or fails to load, the frame is upscaled with the built-in FSR1.
+
+`gamescope-ext-run` builds that command line from a named profile in
+`~/.config/gamescope-ext/run.conf`, so Steam's launch options stay short and carry no paths:
+
+    gamescope-ext-run %command%
+    gamescope-ext-run -p NAME %command%
+    gamescope-ext-run -n -p NAME game             # print the command line instead
+
+`<prefix>/share/gamescope-ext/run.conf.example` documents the profile keys.
 
 ### Licence
 

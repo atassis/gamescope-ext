@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Builds this compositor under its own name and installs it beside, never over, a system gamescope:
-# executable <name> (+ <name>ctl, <name>reaper, ...), Vulkan WSI layer VK_LAYER_<name>_wsi enabled
-# by ENABLE_<NAME>_WSI, data in <prefix>/share/<name>. Upscaler plugins are installed separately
-# (each plugin has its own installer).
+# executable <name> (+ <name>ctl, <name>reaper, ...), the <name>-run launcher, Vulkan WSI layer
+# VK_LAYER_<name>_wsi enabled by ENABLE_<NAME>_WSI, data in <prefix>/share/<name>. Upscaler plugins
+# are installed separately (each plugin has its own installer).
 #
 #   install.sh [--prefix DIR] [--name NAME] [--build-dir DIR] [--jobs N]
 #
@@ -42,7 +42,10 @@ fi
 ninja -C "$build" -j "$jobs"
 meson install -C "$build" --no-rebuild --skip-subprojects
 
+install -Dm755 "$here/tools/gamescope-ext-run" "$prefix/bin/$name-run"
+install -Dm644 "$here/tools/run.conf.example" "$prefix/share/$name/run.conf.example"
+
 list=$prefix/share/$name/installed-files
 cp "$build/meson-logs/install-log.txt" "$list"
-echo "$list" >>"$list"
-echo "installed $prefix/bin/$name (layer VK_LAYER_$layer, env ENABLE_$env); uninstall: $here/uninstall.sh --prefix $prefix --name $name"
+printf '%s\n' "$prefix/bin/$name-run" "$prefix/share/$name/run.conf.example" "$list" >>"$list"
+echo "installed $prefix/bin/$name and $name-run (layer VK_LAYER_$layer, env ENABLE_$env); uninstall: $here/uninstall.sh --prefix $prefix --name $name"

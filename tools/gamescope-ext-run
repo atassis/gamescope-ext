@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# Runs a game inside gamescope-ext with the settings of a named profile. For Steam launch options:
+#
+#   gamescope-ext-run %command%                  # profile "default"
+#   gamescope-ext-run -p NAME %command%          # or GAMESCOPE_EXT_PROFILE=NAME
+#   gamescope-ext-run -n [-p NAME] <command>     # print the gamescope command line, run nothing
+#   gamescope-ext-run --list                     # profiles and installed plugins
+#
+# Profiles are read from $XDG_CONFIG_HOME/gamescope-ext/run.conf (GAMESCOPE_EXT_RUN_CONF overrides);
+# run.conf.example next to the installed host documents every key. Installed as <name>-run, it runs
+# the <name> it was installed beside unless a profile sets `binary`.
+set -euo pipefail
+
+bindir=$(cd "$(dirname "$0")" && pwd)
+self=$(basename "$0")
+exe=${self%-run}
+conf=${GAMESCOPE_EXT_RUN_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/gamescope-ext/run.conf}
+profile=${GAMESCOPE_EXT_PROFILE:-default}
+dry=0
+list=0
+
+fail() { echo "$self: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-p|--profile) [ $# -ge 2 ] || fail "$1 needs a profile name"; profile=$2; shift 2 ;;
+		-n|--dry-run) dry=1; shift ;;
+		--list) list=1; shift ;;
+		--) shift; break ;;
+		*) break ;;
+	esac
+done
+
+# Plugin directories in the host's own search order (EXTERNAL_UPSCALER.md, Discovery).
+plugin_dirs=()
+IFS=: read -ra extra_dirs <<<"${GAMESCOPE_UPSCALER_PATH:-}"
+plugin_dirs+=("${extra_dirs[@]}" "${XDG_DATA_HOME:-$HOME/.local/share}/gamescope-upscalers"
+	"$(dirname "$bindir")/share/gamescope-upscalers")
+IFS=: read -ra data_dirs <<<"${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+for d in "${data_dirs[@]}"; do plugin_dirs+=("$d/gamescope-upscalers"); done
+declare -A seen=()
+unique=()
+for d in "${plugin_dirs[@]}"; do
+	[ -n "$d" ] || continue
+	r=$(realpath -m -- "$d")
+	[ -n "${seen[$r]:-}" ] || unique+=("$d")
+	seen[$r]=1
+done
+plugin_dirs=("${unique[@]}")
+
+keys=' binary filter output scale input sharpness refresh fullscreen hdr args env '
+declare -A cfg=([filter]=fsr [scale]=2 [fullscreen]=1)
+declare -A set_by_profile=()
+sections=()
+
+# run.conf: "[name]" starts a profile, "key = value" sets a key, "#" starts a comment. Keys before
+# any section, or in [default], apply to every profile; the chosen profile's keys override them.
+if [ -f "$conf" ]; then
+	section=default
+	found=0
+	n=0
+	while IFS= read -r line || [ -n "$line" ]; do
+		n=$((n + 1))
+		line=${line%%#*}
+		line="${line#"${line%%[![:space:]]*}"}"
+		line="${line%"${line##*[![:space:]]}"}"
+		[ -n "$line" ] || continue
+		if [[ $line =~ ^\[([A-Za-z0-9._-]+)\]$ ]]; then
+			section=${BASH_REMATCH[1]}
+			sections+=("$section")
+			[ "$section" = "$profile" ] && found=1
+			continue
+		fi
+		[[ $line =~ ^([a-z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]] || fail "$conf:$n: expected 'key = value' or '[profile]'"
+		key=${BASH_REMATCH[1]}
+		[[ $keys == *" $key "* ]] || fail "$conf:$n: unknown key '$key'"
+		if [ "$section" = default ] || [ "$section" = "$profile" ]; then
+			# A profile's own value wins over [default] whichever comes first in the file.
+			if [ "$section" = "$profile" ] || [ -z "${set_by_profile[$key]:-}" ]; then
+				cfg[$key]=${BASH_REMATCH[2]}
+			fi
+			[ "$section" = "$profile" ] && [ "$profile" != default ] && set_by_profile[$key]=1
+		fi
+	done <"$conf"
+	[ "$profile" = default ] || [ $found = 1 ] || fail "no [$profile] in $conf"
+elif [ "$profile" != default ]; then
+	fail "profile '$profile' asked for, but $conf does not exist"
+fi
+
+if [ $list = 1 ]; then
+	echo "config: $conf"
+	echo "profiles: ${sections[*]:-(none)}"
+	for d in "${plugin_dirs[@]}"; do
+		for m in "$d"/*/manifest.json; do
+			[ -f "$m" ] || continue
+			p=$(dirname "$m")
+			data=$(find "$p" -mindepth 1 -maxdepth 1 -type d -printf '%f ' 2>/dev/null)
+			echo "plugin: $(basename "$p")  ($p)${data:+  data: $data}"
+		done
+	done
+	exit 0
+fi
+
+[ $# -gt 0 ] || fail "no command to run (Steam: put %command% after $self)"
+
+output=${cfg[output]:-}
+[[ $output =~ ^([0-9]+)x([0-9]+)$ ]] || fail "set 'output = WIDTHxHEIGHT' (your screen) in $conf"
+out_w=${BASH_REMATCH[1]}
+out_h=${BASH_REMATCH[2]}
+
+if [ -n "${cfg[input]:-}" ]; then
+	[[ ${cfg[input]} =~ ^([0-9]+)x([0-9]+)$ ]] || fail "input must be WIDTHxHEIGHT, got '${cfg[input]}'"
+	in_w=${BASH_REMATCH[1]}
+	in_h=${BASH_REMATCH[2]}
+else
+	[[ ${cfg[scale]} =~ ^([0-9]+)(/([0-9]+))?$ ]] || fail "scale must be N or N/M, got '${cfg[scale]}'"
+	num=${BASH_REMATCH[1]}
+	den=${BASH_REMATCH[3]:-1}
+	in_w=$(( (out_w * den + num / 2) / num ))
+	in_h=$(( (out_h * den + num / 2) / num ))
+fi
+
+# external:<plugin>:<name> with a bare name that is a directory inside the installed plugin's own
+# directory becomes that directory's path, so launch options never carry an absolute path.
+filter=${cfg[filter]}
+if [[ $filter =~ ^external:([^:/]+):([^/]+)$ ]]; then
+	for d in "${plugin_dirs[@]}"; do
+		if [ -f "$d/${BASH_REMATCH[1]}/manifest.json" ]; then
+			[ -d "$d/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}" ] &&
+				filter="external:${BASH_REMATCH[1]}:$d/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+			break
+		fi
+	done
+fi
+
+binary=${cfg[binary]:-$exe}
+if [[ $binary != */* ]]; then
+	if [ -x "$bindir/$binary" ]; then
+		binary=$bindir/$binary
+	else
+		binary=$(command -v "$binary") || fail "'${cfg[binary]:-$exe}' not found beside $self or on PATH"
+	fi
+fi
+
+cmd=("$binary" -w "$in_w" -h "$in_h" -W "$out_w" -H "$out_h" -F "$filter")
+[ "${cfg[fullscreen]}" = 1 ] && cmd+=(-f)
+[ -n "${cfg[refresh]:-}" ] && cmd+=(-r "${cfg[refresh]}")
+[ -n "${cfg[sharpness]:-}" ] && cmd+=(--sharpness "${cfg[sharpness]}")
+[ "${cfg[hdr]:-0}" = 1 ] && cmd+=(--hdr-enabled)
+if [ -n "${cfg[args]:-}" ]; then
+	read -ra more <<<"${cfg[args]}"
+	cmd+=("${more[@]}")
+fi
+cmd+=(-- "$@")
+
+envs=()
+if [ -n "${cfg[env]:-}" ]; then
+	read -ra envs <<<"${cfg[env]}"
+	for kv in "${envs[@]}"; do
+		[[ $kv =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || fail "env entries must be NAME=value, got '$kv'"
+	done
+fi
+
+if [ $dry = 1 ]; then
+	printf '%s' "${envs[*]:+${envs[*]} }"
+	printf '%q ' "${cmd[@]}"
+	echo
+	exit 0
+fi
+exec env "${envs[@]}" "${cmd[@]}"
