@@ -3,8 +3,10 @@
 #
 #   gamescope-ext-run %command%                  # profile "default"
 #   gamescope-ext-run -p NAME %command%          # or GAMESCOPE_EXT_PROFILE=NAME
+#   gamescope-ext-run --scale 3/2 %command%      # any profile key as --KEY VALUE, over the profile
 #   gamescope-ext-run -n [-p NAME] <command>     # print the gamescope command line, run nothing
 #   gamescope-ext-run --list                     # profiles and installed plugins
+#   gamescope-ext-run --help
 #
 # Profiles are read from $XDG_CONFIG_HOME/gamescope-ext/run.conf (GAMESCOPE_EXT_RUN_CONF overrides);
 # run.conf.example next to the installed host documents every key. Installed as <name>-run, it runs
@@ -18,15 +20,48 @@ conf=${GAMESCOPE_EXT_RUN_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/gamescope-ext/r
 profile=${GAMESCOPE_EXT_PROFILE:-default}
 dry=0
 list=0
+keys=' binary filter output scale input sharpness refresh fullscreen hdr args env '
+declare -A cli=()
 
 fail() { echo "$self: $*" >&2; exit 1; }
 
+usage() {
+	cat <<USAGE
+usage: $self [-p PROFILE] [--KEY VALUE ...] [-n] [--] COMMAND [ARGS...]
+       $self --list | --help
+
+Runs COMMAND inside $exe, with sizes, filter and the rest taken from PROFILE (default "default")
+in $conf. In Steam's launch options: $self %command%
+
+  -p, --profile NAME   use [NAME] (also GAMESCOPE_EXT_PROFILE)
+  -n, --dry-run        print the command line instead of running it
+  --list               show the profiles and the installed plugins
+  --KEY VALUE          set a profile key for this run, over the config file:
+      --output WxH       your screen                   --scale N or N/M   output / game size
+      --input WxH        the game's size, not scale    --filter F         a -F value, e.g. fsr,
+      --sharpness 0-20   0 is sharpest                    external:<plugin>[:config]
+      --refresh HZ       -r                            --fullscreen 0|1
+      --hdr 0|1          --hdr-enabled                 --args "..."       more gamescope arguments
+      --env "A=1 B=2"    environment for the run       --binary NAME      which gamescope to run
+
+The keys and an example config: $(dirname "$bindir")/share/$exe/run.conf.example
+USAGE
+}
+
 while [ $# -gt 0 ]; do
 	case "$1" in
+		-h|--help) usage; exit 0 ;;
 		-p|--profile) [ $# -ge 2 ] || fail "$1 needs a profile name"; profile=$2; shift 2 ;;
 		-n|--dry-run) dry=1; shift ;;
 		--list) list=1; shift ;;
 		--) shift; break ;;
+		--*)
+			key=${1#--}
+			[[ $keys == *" $key "* ]] || fail "unknown option $1 (see --help)"
+			[ $# -ge 2 ] || fail "$1 needs a value"
+			cli[$key]=$2
+			shift 2
+			;;
 		*) break ;;
 	esac
 done
@@ -48,7 +83,6 @@ for d in "${plugin_dirs[@]}"; do
 done
 plugin_dirs=("${unique[@]}")
 
-keys=' binary filter output scale input sharpness refresh fullscreen hdr args env '
 declare -A cfg=([filter]=fsr [scale]=2 [fullscreen]=1)
 declare -A set_by_profile=()
 sections=()
@@ -87,6 +121,8 @@ elif [ "$profile" != default ]; then
 	fail "profile '$profile' asked for, but $conf does not exist"
 fi
 
+for key in "${!cli[@]}"; do cfg[$key]=${cli[$key]}; done
+
 if [ $list = 1 ]; then
 	echo "config: $conf"
 	echo "profiles: ${sections[*]:-(none)}"
@@ -104,7 +140,7 @@ fi
 [ $# -gt 0 ] || fail "no command to run (Steam: put %command% after $self)"
 
 output=${cfg[output]:-}
-[[ $output =~ ^([0-9]+)x([0-9]+)$ ]] || fail "set 'output = WIDTHxHEIGHT' (your screen) in $conf"
+[[ $output =~ ^([0-9]+)x([0-9]+)$ ]] || fail "set 'output = WIDTHxHEIGHT' (your screen) in $conf, or pass --output"
 out_w=${BASH_REMATCH[1]}
 out_h=${BASH_REMATCH[2]}
 

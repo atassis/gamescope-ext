@@ -31,9 +31,11 @@ If a plugin declines the sizes, or fails to load, the frame is upscaled with the
 
     gamescope-ext-run %command%
     gamescope-ext-run -p NAME %command%
+    gamescope-ext-run --scale 3/2 --filter external:<plugin> %command%   # any profile key, this run only
     gamescope-ext-run -n -p NAME game             # print the command line instead
 
-`<prefix>/share/gamescope-ext/run.conf.example` documents the profile keys.
+`gamescope-ext-run --help` lists the options; `<prefix>/share/gamescope-ext/run.conf.example`
+documents the profile keys.
 
 ### Licence
 
