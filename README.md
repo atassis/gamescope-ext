@@ -27,10 +27,12 @@ reference plugin, FSR1 on a Vulkan device of your choice, and an installer for i
 If a plugin declines the sizes, or fails to load, the frame is upscaled with the built-in FSR1.
 
 `gamescope-ext-run` builds that command line from a named profile in
-`~/.config/gamescope-ext/run.conf`, so Steam's launch options stay short and carry no paths:
+`~/.config/gamescope-ext/run.conf`, so Steam's launch options stay short and carry no paths. The
+screen size and refresh rate default to the screen the game opens on (KDE Plasma), so one profile
+serves every screen:
 
     gamescope-ext-run %command%
-    gamescope-ext-run -p NAME %command%
+    gamescope-ext-run -p NAME %command% -w {w} -h {h}    # {w} {h}: the game size it chose
     gamescope-ext-run --scale 3/2 --filter external:<plugin> %command%   # any profile key, this run only
     gamescope-ext-run -n -p NAME game             # print the command line instead
 

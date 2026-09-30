@@ -1,23 +1,23 @@
 # gamescope-ext-run profiles. Copy to ~/.config/gamescope-ext/run.conf and edit.
 # Steam launch options: gamescope-ext-run %command%   or   gamescope-ext-run -p NAME %command%
+# {w} and {h} after %command% become the game size, for games that take it: %command% -w {w} -h {h}
 # Check what a profile runs with: gamescope-ext-run -n -p NAME game
 #
 # Keys (keys outside a [section], or in [default], apply to every profile):
-#   output      your screen, WIDTHxHEIGHT (required)
+#   output      your screen: auto (default; the screen KDE's KWin opens new windows on, at its
+#               current mode), a screen name as kscreen-doctor -o lists it (DP-2), or WIDTHxHEIGHT
 #   scale       output / game size: 2 (default), 3/2, 5/3, 3 ...; the game gets output / scale
 #   input       the game's size, WIDTHxHEIGHT, instead of scale
 #   filter      a -F value: fsr (default), nis, sgsr, linear, external:<plugin>[:config]
 #               A bare config name that is a directory inside the installed plugin's own
 #               directory is passed as that directory's path.
 #   sharpness   --sharpness, 0 (sharpest) .. 20
-#   refresh     -r, the game's frame-rate target
+#   refresh     -r, the game's frame-rate target; default: the screen's refresh rate
 #   fullscreen  1 (default) or 0
 #   hdr         1 for --hdr-enabled
 #   args        more gamescope arguments, space-separated
 #   env         NAME=value pairs for gamescope and the game, space-separated
 #   binary      which gamescope to run: a name next to this script or on PATH, or a path
-
-output = 2560x1440
 
 [default]
 filter = fsr

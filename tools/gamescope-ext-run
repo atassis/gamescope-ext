@@ -38,12 +38,15 @@ in $conf. In Steam's launch options: $self %command%
   --list               show the profiles, and each installed plugin with its configs, scales
                        and environment switches
   --KEY VALUE          set a profile key for this run, over the config file:
-      --output WxH       your screen                   --scale N or N/M   output / game size
+      --output O         your screen: auto (default),  --scale N or N/M   output / game size
+                         a name like DP-2, or WxH
       --input WxH        the game's size, not scale    --filter F         a -F value, e.g. fsr,
       --sharpness 0-20   0 is sharpest                    external:<plugin>[:config]
-      --refresh HZ       -r                            --fullscreen 0|1
+      --refresh HZ       -r; default: the screen's rate  --fullscreen 0|1
       --hdr 0|1          --hdr-enabled                 --args "..."       more gamescope arguments
       --env "A=1 B=2"    environment for the run       --binary NAME      which gamescope to run
+
+{w} and {h} in COMMAND's arguments are replaced by the game size, e.g. %command% -w {w} -h {h}.
 
 The keys and an example config: $(dirname "$bindir")/share/$exe/run.conf.example
 USAGE
@@ -156,8 +159,30 @@ fi
 
 [ $# -gt 0 ] || fail "no command to run (Steam: put %command% after $self)"
 
-output=${cfg[output]:-}
-[[ $output =~ ^([0-9]+)x([0-9]+)$ ]] || fail "set 'output = WIDTHxHEIGHT' (your screen) in $conf, or pass --output"
+# output: WIDTHxHEIGHT, a connector name (DP-2, eDP-1) for that screen's current mode, or auto (the
+# default) for the screen KWin opens new windows on. The names and modes come from kscreen-doctor.
+output=${cfg[output]:-auto}
+if ! [[ $output =~ ^[0-9]+x[0-9]+$ ]]; then
+	name=$output
+	if [ "$name" = auto ]; then
+		name=$(gdbus call --session --dest org.kde.KWin --object-path /KWin \
+			--method org.kde.KWin.activeOutputName 2>/dev/null | sed -n "s/^('\(.*\)',)$/\1/p")
+		[ -n "$name" ] || fail "output = auto needs KDE Plasma (KWin); set 'output = WIDTHxHEIGHT' or pass --output"
+	fi
+	command -v kscreen-doctor >/dev/null && command -v python3 >/dev/null ||
+		fail "output = $output needs kscreen-doctor and python3; set 'output = WIDTHxHEIGHT' instead"
+	output=$(kscreen-doctor -j 2>/dev/null | python3 -c 'import json,sys
+for o in json.load(sys.stdin)["outputs"]:
+    if o["name"] == sys.argv[1] and o.get("enabled"):
+        m = {m["id"]: m for m in o["modes"]}[o["currentModeId"]]["size"]
+        mode = {m["id"]: m for m in o["modes"]}[o["currentModeId"]]
+        print(str(m["width"]) + "x" + str(m["height"]), round(mode["refreshRate"]))' "$name") || true
+	[ -n "$output" ] || fail "no enabled screen named '$name' (kscreen-doctor -o lists them)"
+	# Unless the profile sets refresh, the game's frame-rate target is that screen's refresh rate.
+	cfg[refresh]=${cfg[refresh]:-${output#* }}
+	output=${output%% *}
+fi
+[[ $output =~ ^([0-9]+)x([0-9]+)$ ]]
 out_w=${BASH_REMATCH[1]}
 out_h=${BASH_REMATCH[2]}
 
@@ -226,7 +251,10 @@ if [ -n "${cfg[args]:-}" ]; then
 	read -ra more <<<"${cfg[args]}"
 	cmd+=("${more[@]}")
 fi
-cmd+=(-- "$@")
+# {w} and {h} in the game's own arguments become the game size chosen above.
+game=()
+for a in "$@"; do a=${a//\{w\}/$in_w}; game+=("${a//\{h\}/$in_h}"); done
+cmd+=(-- "${game[@]}")
 
 envs=()
 if [ -n "${cfg[env]:-}" ]; then
