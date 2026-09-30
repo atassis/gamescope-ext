@@ -1,0 +1,29 @@
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set.h"
+
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+// A plugin's padded Y8 plane: source pixel (0, 0) at u_offset (its pad_x/pad_y), borders repeating
+// the edge texels; BT.709 luma of the gamma-encoded texel, which the NV12 sampler (YCBCR_709, full
+// range) decodes back.
+layout(binding = 0, scalar)
+uniform layers_t {
+    ivec2 u_offset;
+};
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(coord, imageSize(dst))))
+        return;
+
+    ivec2 src = clamp(coord - u_offset, ivec2(0), textureSize(s_samplers[0], 0) - 1);
+    vec3 c = texelFetch(s_samplers[0], src, 0).rgb;
+    imageStore(dst, coord, vec4(dot(c, vec3(0.2126, 0.7152, 0.0722))));
+}

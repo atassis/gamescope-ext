@@ -1,0 +1,29 @@
+#version 450
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_scalar_block_layout : require
+
+#include "descriptor_set.h"
+
+layout(
+  local_size_x = 8,
+  local_size_y = 8,
+  local_size_z = 1) in;
+
+// The chroma plane of a plugin's NV12 output: sample (x, y) covers output pixels 2x..2x+1, i.e. the
+// source texel under output pixel 2x+1 at scale u_scale.x / u_scale.y (the plugin writes the luma).
+layout(binding = 0, scalar)
+uniform layers_t {
+    ivec2 u_scale;
+};
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(coord, imageSize(dst_chroma))))
+        return;
+
+    ivec2 src = min((coord * 2 + 1) * u_scale.y / u_scale.x, textureSize(s_samplers[0], 0) - 1);
+    vec3 c = texelFetch(s_samplers[0], src, 0).rgb;
+    float y = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    imageStore(dst_chroma, coord, vec4((c.b - y) / 1.8556 + 0.5, (c.r - y) / 1.5748 + 0.5, 0.0, 1.0));
+}

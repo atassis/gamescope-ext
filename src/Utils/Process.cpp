@@ -506,8 +506,23 @@ namespace gamescope::Process
 
     pid_t SpawnProcessInWatchdog( char **argv, bool bRespawn, std::function<void()> fnPreambleInChild )
     {
+        // The reaper installed beside this executable, else whatever PATH finds.
+        static const std::string s_sReaper = []() -> std::string
+        {
+            char szSelf[PATH_MAX];
+            ssize_t len = readlink( "/proc/self/exe", szSelf, sizeof( szSelf ) - 1 );
+            if ( len > 0 )
+            {
+                std::string sPath( szSelf, len );
+                sPath = sPath.substr( 0, sPath.rfind( '/' ) + 1 ) + GAMESCOPE_REAPER_EXE;
+                if ( access( sPath.c_str(), X_OK ) == 0 )
+                    return sPath;
+            }
+            return GAMESCOPE_REAPER_EXE;
+        }();
+
         std::vector<char *> args;
-        args.push_back( (char *)"gamescopereaper" );
+        args.push_back( (char *)s_sReaper.c_str() );
         if ( bRespawn )
             args.push_back( (char *)"--respawn" );
         args.push_back( (char *)"--" );

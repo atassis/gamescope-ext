@@ -290,6 +290,7 @@ struct FrameInfo_t
 	GamescopeUpscaleFilter eUpscaleFilter = GamescopeUpscaleFilter::LINEAR;
 	GamescopeUpscaleScaler eUpscaleScaler = GamescopeUpscaleScaler::AUTO;
 	int nUpscaleSharpness = 0;
+	bool useExternalLayer0;
 	bool bFadingOut;
 	BlurMode blurLayer0;
 	int blurRadius;
@@ -463,9 +464,23 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wl
 gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_bits( uint32_t width, uint32_t height, uint32_t contentWidth, uint32_t contentHeight, uint32_t drmFormat, CVulkanTexture::createFlags texCreateFlags, void *bits );
 gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struct wlr_buffer *buf, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb );
 
+void vulkan_external_on_game_frame( gamescope::Rc<CVulkanTexture> pTex, uint64_t ulCommit );
 std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pScreenshotTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride = nullptr, bool increment = true, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer = nullptr );
 void vulkan_wait( uint64_t ulSeqNo, bool bReset );
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer );
+// Points the next composite at an output image nothing holds (neither the host nor a pending
+// command buffer), adding images up to uMaxImages when all are held. False if none is free.
+bool vulkan_select_free_output_image( uint32_t uMaxImages, uint32_t *puImages, uint32_t *puHeld );
+// With -F external's latest-frame pipeline: true when layer 0 is already on its way through the plugin and
+// its result will request its own composite, so compositing now would show the previous result again.
+bool vulkan_external_result_pending( const struct FrameInfo_t *frameInfo );
+// GAMESCOPE_UPSCALE_TRACE=1: one "[upscale-trace] <id> <stage> <ns>" line (CLOCK_MONOTONIC) per
+// pipeline stage of each upscaled frame; ulTimeNs 0 means now.
+bool upscale_trace_enabled();
+void upscale_trace( uint64_t ulId, const char *pszStage, uint64_t ulTimeNs = 0 );
+// The id of the result the last composite showed for the first time (0 if none), once.
+void upscale_trace_set_shown( uint64_t ulId );
+uint64_t upscale_trace_take_shown();
 gamescope::Rc<CVulkanTexture> vulkan_acquire_screenshot_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
 gamescope::Rc<CVulkanTexture> vulkan_acquire_capture_texture(uint32_t width, uint32_t height, bool exportable, uint32_t drmFormat, EStreamColorspace colorspace = k_EStreamColorspace_Unknown);
 uint32_t vulkan_get_rgb10_capture_format( void );
@@ -589,6 +604,8 @@ struct VulkanOutput_t
 	VkFence acquireFence;
 
 	uint32_t nOutImage; // swapchain index in nested mode, or ping/pong between two RTs
+	// The last two images composited into, for vulkan_get_last_output_image.
+	uint32_t nLastOutImage, nPrevOutImage;
 	std::vector<gamescope::OwningRc<CVulkanTexture>> outputImages;
 	std::vector<gamescope::OwningRc<CVulkanTexture>> outputImagesPartialOverlay;
 	gamescope::OwningRc<CVulkanTexture> temporaryHackyBlankImage;
@@ -618,6 +635,9 @@ enum ShaderType {
 	SHADER_TYPE_NIS,
 	SHADER_TYPE_RGB_TO_NV12,
 	SHADER_TYPE_SGSR,
+	SHADER_TYPE_READBACK_BGRA,
+	SHADER_TYPE_READBACK_Y_PADDED,
+	SHADER_TYPE_READBACK_UV,
 
 	SHADER_TYPE_COUNT
 };
@@ -840,6 +860,9 @@ public:
 	uint64_t submitInternal( CVulkanCmdBuffer* cmdBuf );
 	void wait(uint64_t sequence, bool reset = true);
 	void waitIdle(bool reset = true);
+	bool isFinished(uint64_t sequence);
+	// Blocks until the GPU passes sequence; unlike wait(), safe off the render thread.
+	void waitTimeline(uint64_t sequence);
 	void garbageCollect();
 	VkDescriptorSet descriptorSet( CVulkanCmdBuffer *pCmdBuffer );
 
@@ -1027,6 +1050,9 @@ public:
 
 	void AddDescriptorSet( uint32_t uIndex ) { m_usedDescriptorSets.push_back( uIndex ); }
 	const std::vector<uint32_t> &GetUsedDescriptorSets() const { return m_usedDescriptorSets; }
+	// A binary semaphore this submission signals, e.g. to export as a sync_file after submit.
+	void AddBinarySignal( VkSemaphore pSemaphore ) { m_BinarySignals.push_back( pSemaphore ); }
+	const std::vector<VkSemaphore> &GetBinarySignals() const { return m_BinarySignals; }
 
 private:
 	VkCommandBuffer m_cmdBuffer;
@@ -1051,6 +1077,7 @@ private:
 
 	std::vector<VulkanTimelinePoint_t> m_ExternalDependencies;
 	std::vector<VulkanTimelinePoint_t> m_ExternalSignals;
+	std::vector<VkSemaphore> m_BinarySignals;
 
 	uint32_t m_renderBufferOffset = 0;
 };

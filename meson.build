@@ -71,10 +71,18 @@ else
   openvr_dep = dependency('', required : false)
 endif
 
+exe_name = get_option('exe_name')
+wsi_layer_name = get_option('wsi_layer_name')
+wsi_layer_env = get_option('wsi_layer_env')
+
 add_project_arguments(
   '-DHAVE_PIPEWIRE=@0@'.format(pipewire_dep.found().to_int()),
   '-DHAVE_OPENVR=@0@'.format(openvr_dep.found().to_int()),
-  '-DSCRIPT_DIR="@0@"'.format(prefix / data_dir / 'gamescope/scripts'),
+  '-DSCRIPT_DIR="@0@"'.format(prefix / data_dir / exe_name / 'scripts'),
+  '-DGAMESCOPE_UPSCALER_DATADIR="@0@"'.format(prefix / data_dir / 'gamescope-upscalers'),
+  '-DGAMESCOPE_REAPER_EXE="@0@"'.format(exe_name + 'reaper'),
+  '-DGAMESCOPE_WSI_LAYER_ENV="@0@"'.format(wsi_layer_env),
+  '-DGAMESCOPE_WSI_LAYER_DIR="@0@"'.format(prefix / data_dir / 'vulkan/implicit_layer.d'),
   language: 'cpp',
 )
 
@@ -117,7 +125,16 @@ endif
 
 
 # Handle default script/config/looks stuff
-meson.add_install_script('default_extras_install.sh')
+meson.add_install_script('default_extras_install.sh', exe_name)
+install_headers('src/external_upscaler.h', subdir: 'gamescope')
+
+pkg = import('pkgconfig')
+pkg.generate(
+  name: 'gamescope-external-upscaler',
+  description: 'Gamescope external-upscaler plugin ABI (header only)',
+  subdirs: 'gamescope',
+  variables: ['plugindir=${datadir}/gamescope-upscalers'],
+)
 
 devenv = environment()
 devenv.set('GAMESCOPE_SCRIPT_PATH', join_paths(meson.current_source_dir(), 'scripts'))

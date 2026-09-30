@@ -87,7 +87,29 @@ namespace gamescope
 
 		virtual int Present( const FrameInfo_t *pFrameInfo, bool bAsync ) override
 		{
-            return 0;
+			// GAMESCOPE_HEADLESS_COMPOSITE=1 composites every frame into an offscreen image, so
+			// render-path features (e.g. -F external) run without a display.
+			static const bool bComposite = getenv( "GAMESCOPE_HEADLESS_COMPOSITE" ) && atoi( getenv( "GAMESCOPE_HEADLESS_COMPOSITE" ) ) == 1;
+			if ( !bComposite )
+				return 0;
+			static gamescope::OwningRc<CVulkanTexture> s_pTarget;
+			if ( s_pTarget == nullptr || s_pTarget->width() != g_nOutputWidth || s_pTarget->height() != g_nOutputHeight )
+			{
+				CVulkanTexture::createFlags flags;
+				flags.bStorage = true;
+				flags.bSampled = true;
+				s_pTarget = new CVulkanTexture();
+				if ( !s_pTarget->BInit( g_nOutputWidth, g_nOutputHeight, 1u, DRM_FORMAT_ARGB8888, flags ) )
+				{
+					s_pTarget = nullptr;
+					return -EINVAL;
+				}
+			}
+			std::optional oCompositeResult = vulkan_composite( (FrameInfo_t *)pFrameInfo, nullptr, false, s_pTarget.get() );
+			if ( !oCompositeResult )
+				return -EINVAL;
+			vulkan_wait( *oCompositeResult, true );
+			return 0;
 		}
 
     private:

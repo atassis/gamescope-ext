@@ -176,7 +176,7 @@ const char usage[] =
 	"  -r, --nested-refresh           game refresh rate (frames per second)\n"
 	"  -m, --max-scale                maximum scale factor\n"
 	"  -S, --scaler                   upscaler type (auto, integer, fit, fill, stretch)\n"
-	"  -F, --filter                   upscaler filter (linear, nearest, fsr, nis, pixel, sgsr)\n"
+	"  -F, --filter                   upscaler filter (linear, nearest, fsr, nis, pixel, sgsr, external:<name|path.so>[:config])\n"
 	"                                     fsr => AMD FidelityFX™ Super Resolution 1.0\n"
 	"                                     nis => NVIDIA Image Scaling v1.0.3\n"
 	"                                     sgsr => Snapdragon™ Game Super Resolution 1 with RCAS\n"
@@ -315,6 +315,8 @@ float g_mouseSensitivity = 1.0;
 GamescopeUpscaleFilter g_wantedUpscaleFilter = GamescopeUpscaleFilter::LINEAR;
 GamescopeUpscaleScaler g_wantedUpscaleScaler = GamescopeUpscaleScaler::AUTO;
 int g_upscaleFilterSharpness = 2;
+std::string g_sExternalUpscalerSpec;
+std::string g_sExternalUpscalerConfig;
 
 gamescope::GamescopeModeGeneration g_eGamescopeModeGeneration = gamescope::GAMESCOPE_MODE_GENERATE_CVT;
 
@@ -407,6 +409,23 @@ static enum GamescopeUpscaleScaler parse_upscaler_scaler(const char *str)
 
 static enum GamescopeUpscaleFilter parse_upscaler_filter(const char *str)
 {
+	if (strncmp(str, "external:", 9) == 0) {
+		const char *pszRest = str + 9;
+		const char *pszConfig = strchr(pszRest, ':');
+		if (pszConfig) {
+			g_sExternalUpscalerSpec.assign(pszRest, pszConfig - pszRest);
+			g_sExternalUpscalerConfig = pszConfig + 1;
+		} else {
+			g_sExternalUpscalerSpec = pszRest;
+			g_sExternalUpscalerConfig.clear();
+		}
+		if (g_sExternalUpscalerSpec.empty()) {
+			fprintf(stderr, "gamescope: --filter external: needs a plugin name or path (external:<name> or external:/path/to/plugin.so)\n");
+			exit(1);
+		}
+		return GamescopeUpscaleFilter::EXTERNAL;
+	}
+
 	std::optional<GamescopeUpscaleFilter> oFilter = ParseUpscaleFilter( str );
 	if ( !oFilter )
 	{

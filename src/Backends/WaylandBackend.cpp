@@ -56,6 +56,24 @@ using namespace std::literals;
 
 static LogScope xdg_log( "xdg_backend" );
 
+// GAMESCOPE_UPSCALE_TRACE: the upscaled result a composite showed, carried to its presentation feedback.
+static uint64_t s_ulTraceFeedbackId = 0;
+static std::mutex s_TraceFeedbackMutex;
+static std::unordered_map<struct wp_presentation_feedback *, uint64_t> s_TraceFeedbackIds;
+static void TraceFeedback( struct wp_presentation_feedback *pFeedback, const char *pszStage, uint64_t ulTime )
+{
+    uint64_t ulId = 0;
+    {
+        std::unique_lock lock( s_TraceFeedbackMutex );
+        auto it = s_TraceFeedbackIds.find( pFeedback );
+        if ( it == s_TraceFeedbackIds.end() )
+            return;
+        ulId = it->second;
+        s_TraceFeedbackIds.erase( it );
+    }
+    upscale_trace( ulId, pszStage, ulTime ? ulTime : get_time_in_nanos() );
+}
+
 static const char *GAMESCOPE_proxy_tag = "gamescope-proxy";
 static const char *GAMESCOPE_plane_tag = "gamescope-plane";
 static const char *GAMESCOPE_toplevel_tag = "gamescope-toplevel";
@@ -408,6 +426,7 @@ namespace gamescope
         bool Init();
         void SetFullscreen( bool bFullscreen ); // Thread safe, can be called from the input thread.
         void UpdateFullscreenState();
+        bool PickOutputImage( const FrameInfo_t *pFrameInfo );
 
 
         bool HostCompositorIsCurrentlyVRR() const { return m_bHostCompositorIsCurrentlyVRR; }
@@ -662,6 +681,8 @@ namespace gamescope
 
         virtual void DirtyState( bool bForce = false, bool bForceModeset = false ) override;
         virtual bool PollState() override;
+        // Dispatches host events (wl_buffer.release among them) for up to ulTimeoutNs.
+        void DispatchHostEvents( uint64_t ulTimeoutNs );
 
         virtual std::shared_ptr<BackendBlob> CreateBackendBlob( const std::type_info &type, std::span<const uint8_t> data ) override;
 
@@ -1053,9 +1074,71 @@ namespace gamescope
         }
     }
 
+    // Output images the host can hold at once before a composite waits for a release.
+    static constexpr uint32_t k_uMaxOutputImages = 6;
+
+    // False skips this composite: -F external has a result on the way that will ask for its own, or every
+    // output image is still held by the host (or its queued reads) after up to one refresh interval.
+    bool CWaylandConnector::PickOutputImage( const FrameInfo_t *pFrameInfo )
+    {
+        static uint64_t s_ulComposites, s_ulGrown, s_ulWaits, s_ulSkippedHeld, s_ulSkippedPending;
+        static double s_flWaitMs;
+        bool bEvent = false;
+
+        uint32_t uImages = g_output.outputImages.size(), uHeld = 0;
+        bool bFree = false;
+        const bool bResultPending = vulkan_external_result_pending( pFrameInfo );
+        if ( bResultPending )
+        {
+            s_ulSkippedPending++;
+            bEvent = true;
+        }
+        else
+        {
+            m_pBackend->PollState();
+            const uint32_t uBefore = uImages;
+            bFree = vulkan_select_free_output_image( k_uMaxOutputImages, &uImages, &uHeld );
+            if ( uImages > uBefore )
+            {
+                s_ulGrown++;
+                bEvent = true;
+            }
+            if ( !bFree )
+            {
+                const uint64_t ulStart = get_time_in_nanos();
+                const uint64_t ulDeadline = ulStart + 1'000'000'000'000ull / uint64_t( std::max( g_nOutputRefresh, 1000 ) );
+                for ( uint64_t ulNow = ulStart; !bFree && ulNow < ulDeadline; ulNow = get_time_in_nanos() )
+                {
+                    // Sliced: a host release is an event, a finished host read is only seen by polling.
+                    m_pBackend->DispatchHostEvents( std::min<uint64_t>( ulDeadline - ulNow, 500'000 ) );
+                    uint32_t uHeldNow;
+                    bFree = vulkan_select_free_output_image( k_uMaxOutputImages, &uImages, &uHeldNow );
+                }
+                s_ulWaits++;
+                s_flWaitMs += ( get_time_in_nanos() - ulStart ) / 1'000'000.0;
+                s_ulSkippedHeld += !bFree;
+                bEvent = true;
+            }
+            s_ulComposites += bFree;
+        }
+
+        const uint64_t ulEvents = s_ulGrown + s_ulWaits + s_ulSkippedPending;
+        const auto pow2 = []( uint64_t n ) { return n && !( n & ( n - 1 ) ); };
+        if ( ( bFree && pow2( s_ulComposites ) ) || ( bEvent && pow2( ulEvents ) ) )
+        {
+            xdg_log.infof( "output images: %u, %u held at pick; %" PRIu64 " composites, %" PRIu64 " grown, %" PRIu64 " waits (%.2f ms mean), skipped %" PRIu64 " all held, %" PRIu64 " result pending",
+                uImages, uHeld, s_ulComposites, s_ulGrown, s_ulWaits, s_ulWaits ? s_flWaitMs / s_ulWaits : 0.0, s_ulSkippedHeld, s_ulSkippedPending );
+        }
+
+        if ( !bFree && !bResultPending )
+            force_repaint();
+        return bFree;
+    }
+
     int CWaylandConnector::Present( const FrameInfo_t *pFrameInfo, bool bAsync )
     {
         UpdateFullscreenState();
+        uint64_t ulTraceId = 0;
 
         bool bNeedsFullComposite = false;
 
@@ -1077,6 +1160,7 @@ namespace gamescope
             bNeedsFullComposite |= pFrameInfo->useFSRLayer0;
             bNeedsFullComposite |= pFrameInfo->useNISLayer0;
             bNeedsFullComposite |= pFrameInfo->useSGSRLayer0;
+            bNeedsFullComposite |= pFrameInfo->useExternalLayer0;
             bNeedsFullComposite |= pFrameInfo->blurLayer0;
             bNeedsFullComposite |= bNeedsCompositeFromFilter;
             bNeedsFullComposite |= g_bColorSliderInUse;
@@ -1128,6 +1212,10 @@ namespace gamescope
             }
             else
             {
+                if ( !PickOutputImage( pFrameInfo ) )
+                    return 0;
+
+                const uint64_t ulCompositeStart = upscale_trace_enabled() ? get_time_in_nanos() : 0;
                 std::optional oCompositeResult = vulkan_composite( (FrameInfo_t *)pFrameInfo, nullptr, false );
 
                 if ( !oCompositeResult )
@@ -1137,6 +1225,13 @@ namespace gamescope
                 }
 
                 vulkan_wait( *oCompositeResult, true );
+                ulTraceId = upscale_trace_take_shown();
+                if ( ulTraceId )
+                {
+                    upscale_trace( ulTraceId, "comp_start", ulCompositeStart );
+                    upscale_trace( ulTraceId, "comp_done" );
+                    s_ulTraceFeedbackId = ulTraceId;
+                }
 
                 FrameInfo_t::Layer_t compositeLayer{};
                 compositeLayer.scale.x = 1.0;
@@ -1162,6 +1257,9 @@ namespace gamescope
             m_Planes[i].Commit();
 
         wl_display_flush( m_pBackend->GetDisplay() );
+        if ( ulTraceId )
+            upscale_trace( ulTraceId, "kwin_commit" );
+        s_ulTraceFeedbackId = 0;
 
         GetVBlankTimer().UpdateWasCompositing( bNeedsFullComposite );
         GetVBlankTimer().UpdateLastDrawTime( get_time_in_nanos() - g_SteamCompMgrVBlankTime.ulWakeupTime );
@@ -1467,6 +1565,11 @@ namespace gamescope
             {
                 struct wp_presentation_feedback *pFeedback = wp_presentation_feedback( m_pBackend->GetPresentation(), m_pSurface );
                 wp_presentation_feedback_add_listener( pFeedback, &s_PresentationFeedbackListener, this );
+                if ( s_ulTraceFeedbackId )
+                {
+                    std::unique_lock lock( s_TraceFeedbackMutex );
+                    s_TraceFeedbackIds[ pFeedback ] = std::exchange( s_ulTraceFeedbackId, 0 );
+                }
             }
 
             if ( m_pWPColorManagedSurface )
@@ -1801,6 +1904,7 @@ namespace gamescope
         }
 
         GetVBlankTimer().MarkVBlank( ulTime, true );
+        TraceFeedback( pFeedback, "presented", ulTime );
         wp_presentation_feedback_destroy( pFeedback );
 
         // Nudge so that steamcompmgr releases commits.
@@ -1808,6 +1912,7 @@ namespace gamescope
     }
     void CWaylandPlane::Wayland_PresentationFeedback_Discarded( struct wp_presentation_feedback *pFeedback )
     {
+        TraceFeedback( pFeedback, "discarded", 0 );
         wp_presentation_feedback_destroy( pFeedback );
 
         // Nudge so that steamcompmgr releases commits.
@@ -2199,6 +2304,37 @@ namespace gamescope
     void CWaylandBackend::DirtyState( bool bForce, bool bForceModeset )
     {
     }
+    void CWaylandBackend::DispatchHostEvents( uint64_t ulTimeoutNs )
+    {
+        wl_display_flush( m_pDisplay );
+
+        while ( wl_display_prepare_read( m_pDisplay ) != 0 )
+            wl_display_dispatch_pending( m_pDisplay );
+
+        pollfd pollfd =
+        {
+            .fd     = wl_display_get_fd( m_pDisplay ),
+            .events = POLLIN,
+        };
+        const timespec timeout =
+        {
+            .tv_sec  = time_t( ulTimeoutNs / 1'000'000'000ull ),
+            .tv_nsec = long( ulTimeoutNs % 1'000'000'000ull ),
+        };
+        int nRet;
+        do
+        {
+            nRet = ppoll( &pollfd, 1, &timeout, nullptr );
+        } while ( nRet < 0 && ( errno == EINTR || errno == EAGAIN ) );
+
+        if ( nRet > 0 )
+            wl_display_read_events( m_pDisplay );
+        else
+            wl_display_cancel_read( m_pDisplay );
+
+        wl_display_dispatch_pending( m_pDisplay );
+    }
+
     bool CWaylandBackend::PollState()
     {
         wl_display_flush( m_pDisplay );

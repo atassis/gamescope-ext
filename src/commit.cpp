@@ -138,6 +138,13 @@ bool commit_t::ShouldPreemptivelyUpscale( GamescopeUpscaleFilter eFilter, Gamesc
     if ( DoesHardwareSupportUpscaleFilter( eFilter ) )
         return false;
 
+    // The external-plugin pass runs on the plugin's device; keep it on the
+    // composite path only. Letting EXTERNAL through here caches
+    // an unfiltered output-size blit that GetTexture() then serves forever,
+    // masking needsScaling and skipping the plugin after frame 0.
+    if ( eFilter == GamescopeUpscaleFilter::EXTERNAL )
+        return false;
+
     if ( !vulkanTex )
         return false;
 

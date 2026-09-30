@@ -1,8 +1,9 @@
 #!/usr/bin/env sh
 
-# Remove old Gamescope default configs and add our own.
-mkdir -p "${DESTDIR}/${MESON_INSTALL_PREFIX}/share/gamescope"
-rm -rf "${DESTDIR}/${MESON_INSTALL_PREFIX}/share/gamescope/scripts" || true
-rm -rf "${DESTDIR}/${MESON_INSTALL_PREFIX}/share/gamescope/looks" || true
-cp -r "${MESON_SOURCE_ROOT}/scripts" "${DESTDIR}/${MESON_INSTALL_PREFIX}/share/gamescope/scripts"
-cp -r "${MESON_SOURCE_ROOT}/looks" "${DESTDIR}/${MESON_INSTALL_PREFIX}/share/gamescope/looks"
+# Remove old Gamescope default configs and add our own. $1 is the data directory name.
+d="${DESTDIR}/${MESON_INSTALL_PREFIX}/share/${1:-gamescope}"
+mkdir -p "$d"
+rm -rf "$d/scripts" || true
+rm -rf "$d/looks" || true
+cp -r "${MESON_SOURCE_ROOT}/scripts" "$d/scripts"
+cp -r "${MESON_SOURCE_ROOT}/looks" "$d/looks"

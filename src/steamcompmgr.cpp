@@ -3233,9 +3233,14 @@ paint_all( global_focus_t *pFocus, bool async )
 
 					bool needsScaling = frameInfo.layers.get( 0 ).scale.x < 0.999f && frameInfo.layers.get( 0 ).scale.y < 0.999f;
 					GamescopeUpscaleFilter eLayer0Filter = ResolveUpscaleFilter( frameInfo.eUpscaleFilter, frameInfo.layers.get( 0 ).colorspace, frameInfo.layers.get( 0 ).isYcbcr() );
-					frameInfo.useFSRLayer0 = eLayer0Filter == GamescopeUpscaleFilter::FSR && needsScaling;
+					// A v1 external plugin gets 8 bpc planes (and may decline desc.hdr),
+					// so an HDR layer falls back to GPU FSR instead of quantizing/clipping.
+					bool isHDRLayer0 = ColorspaceIsHDR( frameInfo.layers.get( 0 ).colorspace );
+					frameInfo.useFSRLayer0 = needsScaling && ( eLayer0Filter == GamescopeUpscaleFilter::FSR ||
+						( eLayer0Filter == GamescopeUpscaleFilter::EXTERNAL && isHDRLayer0 ) );
 					frameInfo.useNISLayer0 = eLayer0Filter == GamescopeUpscaleFilter::NIS && needsScaling;
 					frameInfo.useSGSRLayer0 = eLayer0Filter == GamescopeUpscaleFilter::SGSR && needsScaling;
+					frameInfo.useExternalLayer0 = eLayer0Filter == GamescopeUpscaleFilter::EXTERNAL && needsScaling && !isHDRLayer0;
 				}
 				if ( pFocus == GetCurrentMouseFocus() )
 					update_touch_scaling( &frameInfo );
@@ -3409,6 +3414,7 @@ paint_all( global_focus_t *pFocus, bool async )
 		frameInfo.useFSRLayer0 = false;
 		frameInfo.useNISLayer0 = false;
 		frameInfo.useSGSRLayer0 = false;
+		frameInfo.useExternalLayer0 = false;
 	}
 
 	pFocus->eActiveUpscaler = GamescopeUpscaleFilter::LINEAR;
@@ -8012,6 +8018,13 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
 	// very fast loop yes
 	for ( auto& entry : ctx->doneCommits.listCommitsDone )
 	{
+		static uint64_t s_ulTraceLastCommit = 0;
+		if ( upscale_trace_enabled() && entry.commitID > s_ulTraceLastCommit )
+		{
+			s_ulTraceLastCommit = entry.commitID;
+			upscale_trace( entry.commitID, "cdone" );
+		}
+
 		steamcompmgr_win_t *entry_win = nullptr;
 		for ( steamcompmgr_win_t *w = ctx->list; w; w = w->xwayland().next )
 		{
@@ -8020,6 +8033,24 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
 
 			entry_win = w;
 			break;
+		}
+
+		// -F external starts on a focused window's frame as soon as it is done, not when a composite
+		// latches it (FIFO commits wait below for vblank, and stay in this list until then, so each
+		// is seen again every pass: only a commit newer than the last one started counts).
+		static uint64_t s_ulExtLastCommit = 0;
+		global_focus_t *pFocus = GetCurrentFocus();
+		if ( entry_win && pFocus && entry_win == pFocus->focusWindow &&
+		     pFocus->eUpscaleFilter == GamescopeUpscaleFilter::EXTERNAL && entry.commitID > s_ulExtLastCommit )
+		{
+			for ( auto &commit : entry_win->commit_queue )
+			{
+				if ( commit->commitID == entry.commitID )
+				{
+					vulkan_external_on_game_frame( commit->vulkanTex, commit->commitID );
+					s_ulExtLastCommit = entry.commitID;
+				}
+			}
 		}
 
 		// Only pace windows the FPS limiter covers.
@@ -8542,7 +8573,12 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 	{
 		newCommit->SetFence( fence, mango_nudge, uMangoMsgType, doneCommits );
 		if ( bKnownReady )
+		{
 			newCommit->Signal();
+			// This pass already went through the done list: without a nudge the commit waits
+			// for the next wakeup, often the next vblank.
+			nudge_steamcompmgr();
+		}
 		else
 			g_ImageWaiter.AddWaitable( newCommit.get() );
 	}
@@ -9396,6 +9432,24 @@ RelativeMouseFilterDefaults(),
 	s_uRelativeMouseFilteredAppids = std::move( uFilterAppids );
 }, true);
 
+// Appends pszDir to VK_ADD_IMPLICIT_LAYER_PATH unless the loader already scans it.
+static void AddImplicitLayerPath( const char *pszDir )
+{
+	std::vector<std::string> scanned = { "/usr/share/vulkan/implicit_layer.d", "/usr/local/share/vulkan/implicit_layer.d", "/etc/vulkan/implicit_layer.d" };
+	if ( const char *pszDataHome = getenv( "XDG_DATA_HOME" ); pszDataHome && *pszDataHome )
+		scanned.push_back( std::string( pszDataHome ) + "/vulkan/implicit_layer.d" );
+	else if ( const char *pszHome = getenv( "HOME" ) )
+		scanned.push_back( std::string( pszHome ) + "/.local/share/vulkan/implicit_layer.d" );
+	for ( const std::string &s : scanned )
+		if ( s == pszDir )
+			return;
+
+	std::string sPath = pszDir;
+	if ( const char *pszCurrent = getenv( "VK_ADD_IMPLICIT_LAYER_PATH" ); pszCurrent && *pszCurrent )
+		sPath = std::string( pszCurrent ) + ":" + sPath;
+	setenv( "VK_ADD_IMPLICIT_LAYER_PATH", sPath.c_str(), 1 );
+}
+
 void LaunchNestedChildren( char **ppPrimaryChildArgv )
 {
 	// We could just run this inside the child process,
@@ -9408,7 +9462,14 @@ void LaunchNestedChildren( char **ppPrimaryChildArgv )
 
 		unsetenv( "ENABLE_VKBASALT" );
 		// Enable Gamescope WSI by default for nested.
-		setenv( "ENABLE_GAMESCOPE_WSI", "1", 0 );
+		setenv( "ENABLE_" GAMESCOPE_WSI_LAYER_ENV, "1", 0 );
+		// A renamed layer must not stack with a system gamescope's layer, and may live in a prefix
+		// the Vulkan loader does not scan.
+		if ( strcmp( GAMESCOPE_WSI_LAYER_ENV, "GAMESCOPE_WSI" ) != 0 )
+		{
+			setenv( "DISABLE_GAMESCOPE_WSI", "1", 1 );
+			AddImplicitLayerPath( GAMESCOPE_WSI_LAYER_DIR );
+		}
 
 		// Unset this to avoid it leaking to Proton apps, etc.
 		unsetenv( "SDL_VIDEODRIVER" );
@@ -10022,6 +10083,7 @@ steamcompmgr_main(int argc, char **argv)
 		{
 			g_SteamCompMgrVBlankTime = *pendingVBlank;
 			vblank = true;
+			upscale_trace( 0, "tick" );
 		}
 
 		if ( g_bRun == false )

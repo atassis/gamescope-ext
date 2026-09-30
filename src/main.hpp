@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -45,6 +46,7 @@ enum class GamescopeUpscaleFilter : uint32_t
     NIS,
     PIXEL,
     SGSR,
+    EXTERNAL, // external:<name|path-to-.so>[:<plugin-config>], src/external_upscaler.h ABI
 
     FROM_VIEW = 0xF, // internal
 };
@@ -69,6 +71,12 @@ static constexpr GamescopeUpscaleFilter ResolveUpscaleFilter( GamescopeUpscaleFi
         return eFilter;
     return bYcbcr ? GamescopeUpscaleFilter::LINEAR : GamescopeUpscaleFilter::FSR;
 }
+
+// Set by parse_upscaler_filter() when g_wantedUpscaleFilter == EXTERNAL: "spec" or "spec:config"
+// split on the first ':'. A spec containing '/' is a library path, anything else a plugin name
+// (see ExternalUpscaler::Resolve).
+extern std::string g_sExternalUpscalerSpec;
+extern std::string g_sExternalUpscalerConfig;
 
 static constexpr bool DoesHardwareSupportUpscaleFilter( GamescopeUpscaleFilter eFilter )
 {

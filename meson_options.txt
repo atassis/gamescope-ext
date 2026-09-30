@@ -10,3 +10,6 @@ option('enable_openvr_support',      type : 'boolean', value : true, description
 option('enable_tests',               type : 'boolean', value : true, description: 'Build unit tests')
 option('enable_zenity',              type : 'boolean', value : true, description: 'Build with zenity support in the WSI layers error handling')
 option('benchmark', type: 'feature', description: 'Benchmark tools')
+option('exe_name',                   type : 'string', value : 'gamescope', description: 'Name of the main executable; also prefixes the helper tools and names the data directory')
+option('wsi_layer_name',             type : 'string', value : 'FROG_gamescope_wsi', description: 'WSI layer name (VK_LAYER_<name>, libVkLayer_<name>_<arch>.so)')
+option('wsi_layer_env',              type : 'string', value : 'GAMESCOPE_WSI', description: 'ENABLE_/DISABLE_ environment variable suffix of the WSI layer')

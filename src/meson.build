@@ -71,6 +71,9 @@ shader_src = [
   'shaders/cs_nis_fp16.comp',
   'shaders/cs_rgb_to_nv12.comp',
   'shaders/cs_sgsr.comp',
+  'shaders/cs_readback_bgra.comp',
+  'shaders/cs_readback_y_padded.comp',
+  'shaders/cs_readback_uv.comp',
 ]
 
 spirv_shaders = glsl_generator.process(shader_src)
@@ -115,6 +118,7 @@ src = [
   'wlserver.cpp',
   'vblankmanager.cpp',
   'rendervulkan.cpp',
+  'external_upscaler_host.cpp',
   'log.cpp',
   'ime.cpp',
   'mangoapp.cpp',
@@ -191,7 +195,7 @@ gamescope_version = configure_file(
 )
 
   executable(
-    'gamescope',
+    exe_name,
     src, reshade_src, gamescope_version,
     include_directories : [reshade_include, sol2_include],
     dependencies: [
@@ -215,18 +219,18 @@ gamescope_core_src = [
 ]
 
 if pipewire_dep.found()
-  executable( 'gamescopestream', ['Apps/gamescopestream.cpp'], gamescope_core_src, gamescope_version, protocols_client_src, dependencies: [ pipewire_dep, dep_wayland, libdecor_dep, cap_dep ], install: true )
+  executable( exe_name + 'stream', ['Apps/gamescopestream.cpp'], gamescope_core_src, gamescope_version, protocols_client_src, dependencies: [ pipewire_dep, dep_wayland, libdecor_dep, cap_dep ], install: true )
 endif
 
-executable('gamescopereaper', ['Apps/gamescopereaper.cpp', gamescope_core_src], gamescope_version, dependencies: [cap_dep], install:true )
+executable(exe_name + 'reaper', ['Apps/gamescopereaper.cpp', gamescope_core_src], gamescope_version, dependencies: [cap_dep], install:true )
 
 benchmark_dep = dependency('benchmark', required: get_option('benchmark'), disabler: true)
 executable('gamescope_color_microbench', ['color_bench.cpp', 'color_helpers.cpp'], gamescope_core_src, gamescope_version, dependencies:[benchmark_dep, glm_dep, cap_dep])
 
 executable('gamescope_color_tests', ['color_tests.cpp', 'color_helpers.cpp'], gamescope_core_src, gamescope_version, dependencies:[glm_dep, cap_dep])
 
-executable('gamescopectl', ['Apps/gamescopectl.cpp'], gamescope_core_src, gamescope_version, protocols_client_src, dependencies: [dep_wayland, cap_dep], install: true, cpp_args: ['-Werror=switch-enum'])
+executable(exe_name + 'ctl', ['Apps/gamescopectl.cpp'], gamescope_core_src, gamescope_version, protocols_client_src, dependencies: [dep_wayland, cap_dep], install: true, cpp_args: ['-Werror=switch-enum'])
 
-executable('gamescope-type', ['Apps/gamescope_type.c'], protocols_client_src, dependencies: [dep_wayland, cap_dep], install:true )
+executable(exe_name + '-type', ['Apps/gamescope_type.c'], protocols_client_src, dependencies: [dep_wayland, cap_dep], install:true )
 
 executable('gamescope_hotkey_example', ['Apps/gamescope_hotkey_example.cpp'], gamescope_core_src, gamescope_version, protocols_client_src, dependencies: [dep_wayland, xkbcommon, cap_dep], install: false )

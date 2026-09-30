@@ -10,7 +10,12 @@
 #include <array>
 #include <bitset>
 #include <deque>
+#include <chrono>
+#include <cinttypes>
+#include <climits>
 #include <dlfcn.h>
+#include <poll.h>
+#include <linux/dma-buf.h>
 #include "vulkan_include.h"
 #include "Utils/Algorithm.h"
 
@@ -45,6 +50,15 @@
 #include "cs_composite_rcas_1px.h"
 #include "cs_easu.h"
 #include "cs_easu_fp16.h"
+#include "cs_readback_bgra.h"
+#include "cs_readback_y_padded.h"
+#include "cs_readback_uv.h"
+#include "external_upscaler_host.hpp"
+#include <poll.h>
+#include <condition_variable>
+#include <deque>
+#include <thread>
+#include <unordered_map>
 #include "cs_gaussian_blur_horizontal.h"
 #include "cs_nis.h"
 #include "cs_nis_fp16.h"
@@ -985,6 +999,9 @@ bool CVulkanDevice::createShaders()
 	}
 	SHADER(RGB_TO_NV12, cs_rgb_to_nv12);
 	SHADER(SGSR, cs_sgsr);
+	SHADER(READBACK_BGRA, cs_readback_bgra);
+	SHADER(READBACK_Y_PADDED, cs_readback_y_padded);
+	SHADER(READBACK_UV, cs_readback_uv);
 #undef SHADER
 
 	for (uint32_t i = 0; i < shaderInfos.size(); i++)
@@ -1216,6 +1233,9 @@ void CVulkanDevice::compileAllPipelines(std::stop_token st)
 	SHADER(NIS, 1, 1, 1);
 	SHADER(RGB_TO_NV12, 1, 1, 1);
 	SHADER(SGSR, 1, 1, 1);
+	SHADER(READBACK_BGRA, 1, 1, 1);
+	SHADER(READBACK_Y_PADDED, 1, 1, 1);
+	SHADER(READBACK_UV, 1, 1, 1);
 #undef SHADER
 
 	for (auto& info : pipelineInfos) {
@@ -1341,6 +1361,12 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 	{
 		pSignalSemaphores.push_back( dep.pTimelineSemaphore->pVkSemaphore );
 		ulSignalPoints.push_back( dep.ulPoint );
+	}
+
+	for ( VkSemaphore pBinary : cmdBuffer->GetBinarySignals() )
+	{
+		pSignalSemaphores.push_back( pBinary );
+		ulSignalPoints.push_back( 0 ); // ignored for a binary semaphore
 	}
 
 	for ( auto &dep : cmdBuffer->GetExternalDependencies() )
@@ -1572,6 +1598,25 @@ void CVulkanDevice::waitIdle(bool reset)
 	wait(m_submissionSeqNo, reset);
 }
 
+void CVulkanDevice::waitTimeline(uint64_t sequence)
+{
+	VkSemaphoreWaitInfo waitInfo = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+		.semaphoreCount = 1,
+		.pSemaphores = &m_scratchTimelineSemaphore,
+		.pValues = &sequence,
+	};
+	vk_check( vk.WaitSemaphores( device(), &waitInfo, ~0ull ) );
+}
+
+// Non-blocking: true once the GPU has signalled past sequence, false otherwise.
+bool CVulkanDevice::isFinished(uint64_t sequence)
+{
+	uint64_t currentSeqNo;
+	vk_check( vk.GetSemaphoreCounterValue(device(), m_scratchTimelineSemaphore, &currentSeqNo) );
+	return currentSeqNo >= sequence;
+}
+
 void CVulkanDevice::resetCmdBuffers(uint64_t sequence)
 {
 	auto last = m_pendingCmdBufs.find(sequence);
@@ -1608,6 +1653,7 @@ void CVulkanCmdBuffer::reset()
 
 	m_ExternalDependencies.clear();
 	m_ExternalSignals.clear();
+	m_BinarySignals.clear();
 }
 
 void CVulkanCmdBuffer::begin()
@@ -3341,7 +3387,7 @@ bool vulkan_remake_swapchain( void )
 	return bRet;
 }
 
-static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
+static CVulkanTexture::createFlags vulkan_output_image_flags()
 {
 	CVulkanTexture::createFlags outputImageflags;
 	outputImageflags.bFlippable = true;
@@ -3349,7 +3395,15 @@ static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
 	outputImageflags.bTransferSrc = true; // for screenshots
 	outputImageflags.bSampled = true; // for pipewire blits
 	outputImageflags.bOutputImage = true;
+	return outputImageflags;
+}
 
+static bool vulkan_make_output_images( VulkanOutput_t *pOutput )
+{
+	CVulkanTexture::createFlags outputImageflags = vulkan_output_image_flags();
+
+	pOutput->nLastOutImage = 2;
+	pOutput->nPrevOutImage = 1;
 	pOutput->outputImages.resize(3); // extra image for partial composition.
 	pOutput->outputImagesPartialOverlay.resize(3);
 
@@ -3958,6 +4012,20 @@ struct SgsrPushData_t
 	}
 };
 
+struct ReadbackPadPushData_t
+{
+	int32_t x, y;
+
+	ReadbackPadPushData_t( uint32_t padX, uint32_t padY ) : x( int32_t( padX ) ), y( int32_t( padY ) ) {}
+};
+
+struct ReadbackScalePushData_t
+{
+	int32_t num, den;
+
+	ReadbackScalePushData_t( uint32_t scaleNum, uint32_t scaleDen ) : num( int32_t( scaleNum ) ), den( int32_t( scaleDen ) ) {}
+};
+
 struct RcasPushData_t
 {
 	uvec2_t u_layer0Offset;
@@ -4307,8 +4375,696 @@ namespace
 
 ReshadeEffectPipeline *g_pLastReshadeEffect = nullptr;
 
+static void composite_upscaled_layer0( struct FrameInfo_t *frameInfo, CVulkanCmdBuffer *cmdBuffer, gamescope::Rc<CVulkanTexture> compositeImage, EOTF outputTF, gamescope::Rc<CVulkanTexture> pOutput, float flScale )
+{
+	// The plugin output is flScale x layer 0; the blit stretches it to whatever size layer 0 is shown at.
+	struct FrameInfo_t upFrameInfo = *frameInfo;
+	upFrameInfo.layers.get( 0 ).tex = pOutput;
+	// The NV12 sampler returns the readback's gamma-encoded values and gamescope treats YCbCr as
+	// already linear, so the composite has to apply the sRGB decode itself.
+	if ( pOutput->isYcbcr() )
+		upFrameInfo.layers.get( 0 ).colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
+	upFrameInfo.layers.get( 0 ).scale.x *= flScale;
+	upFrameInfo.layers.get( 0 ).scale.y *= flScale;
+
+	cmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_BLIT, upFrameInfo.layers.count(), upFrameInfo.ycbcrMask(), 0u, upFrameInfo.colorspaceMask(), outputTF ) );
+	bind_all_layers( cmdBuffer, &upFrameInfo );
+	cmdBuffer->bindTarget( compositeImage );
+	cmdBuffer->uploadConstants<BlitPushData_t>( &upFrameInfo );
+	cmdBuffer->dispatch( div_roundup( currentOutputWidth, 8 ), div_roundup( currentOutputHeight, 8 ) );
+}
+
+static double ms_between( std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b )
+{
+	return std::chrono::duration<double, std::milli>( b - a ).count();
+}
+
+bool upscale_trace_enabled()
+{
+	static const bool bTrace = getenv( "GAMESCOPE_UPSCALE_TRACE" ) && atoi( getenv( "GAMESCOPE_UPSCALE_TRACE" ) ) == 1;
+	return bTrace;
+}
+
+void upscale_trace( uint64_t ulId, const char *pszStage, uint64_t ulTimeNs )
+{
+	if ( !upscale_trace_enabled() )
+		return;
+	if ( !ulTimeNs )
+	{
+		timespec ts;
+		clock_gettime( CLOCK_MONOTONIC, &ts );
+		ulTimeNs = uint64_t( ts.tv_sec ) * 1'000'000'000ull + uint64_t( ts.tv_nsec );
+	}
+	fprintf( stderr, "[upscale-trace] %" PRIu64 " %s %" PRIu64 "\n", ulId, pszStage, ulTimeNs );
+}
+
+static std::atomic<uint64_t> s_ulUpscaleTraceShown{ 0 };
+void upscale_trace_set_shown( uint64_t ulId )
+{
+	if ( upscale_trace_enabled() )
+		s_ulUpscaleTraceShown = ulId;
+}
+uint64_t upscale_trace_take_shown()
+{
+	return s_ulUpscaleTraceShown.exchange( 0 );
+}
+
+// steady_clock is CLOCK_MONOTONIC here, the clock upscale_trace() stamps with.
+static uint64_t trace_ns( std::chrono::steady_clock::time_point t )
+{
+	return uint64_t( std::chrono::duration_cast<std::chrono::nanoseconds>( t.time_since_epoch() ).count() );
+}
+
+// Defined further down, once s_ext (the -F external slot state) exists.
+static bool ExtResultPending( const CVulkanTexture *pLayer0 );
+
+// The double-composite pattern this guards against: a game commit composites the previous result,
+// then the result's own completion repaint composites the new one, over-driving the host's
+// output-image ring. GAMESCOPE_EXTERNAL_ONE_PER_RESULT=0 restores per-commit compositing.
+bool vulkan_external_result_pending( const struct FrameInfo_t *frameInfo )
+{
+	static const bool bEnabled = !getenv( "GAMESCOPE_EXTERNAL_ONE_PER_RESULT" ) || atoi( getenv( "GAMESCOPE_EXTERNAL_ONE_PER_RESULT" ) ) != 0;
+	if ( !bEnabled || !frameInfo->useExternalLayer0 || frameInfo->layers.count() < 1 )
+		return false;
+	return ExtResultPending( frameInfo->layers.get( 0 ).tex.get() );
+}
+
+// Layer 0 through an external_upscaler.h plugin: generic dma-buf readback (whichever
+// gamescope-converted plane negotiate() picked -- BGRA8 or padded Y8/NV12, see PickFormat below),
+// async submit, generic composite. No plugin-specific code lives here -- see
+// src/external_upscaler_host.cpp.
+//
+// Latest-frame pipeline: k_nExtSlots (in, out) texture pairs. A focused
+// window's commit is read back and submitted when it is done (vulkan_external_on_game_frame), at
+// most k_nExtInflight at once; each composite polls the fences, shows the newest finished slot and
+// keeps the previously shown one for one more composite before reusing it. A commit is submitted
+// once, from whichever of the two paths sees it first. GAMESCOPE_EXTERNAL_EARLY=0 leaves the
+// submit to the composite; GAMESCOPE_EXTERNAL_LATE_MS (default 1) is how long a composite waits
+// for the oldest job in flight when nothing newer is ready.
+namespace EU = gamescope::ExternalUpscaler;
+enum class ExtPlaneMode_t { Unset, Bgra8Unpadded, Y8Nv12Padded };
+enum class ExtSlot_t { Free, Inflight, Ready, Shown, Retiring };
+static constexpr uint32_t k_nExtSlots = 4, k_nExtInflight = 2;
+struct ExtUpscaleState_t
+{
+	bool bLoaded = false, bTriedLoad = false;
+	uint32_t inW = 0, inH = 0, outW = 0, outH = 0;
+	gs_upscaler_negotiate_result_t negotiation = {};
+	ExtPlaneMode_t mode = ExtPlaneMode_t::Unset;
+	uint32_t inPadW = 0, inPadH = 0, outPadW = 0, outPadH = 0, padX = 0, padY = 0; // Y8Nv12Padded only
+	gamescope::OwningRc<CVulkanTexture> pIn[k_nExtSlots], pOut[k_nExtSlots];
+	VkSemaphore pReadDone[k_nExtSlots] = {}; // signalled by the slot's readback, exported as submit()'s in_fence
+
+	ExtSlot_t eSlot[k_nExtSlots] = {};
+	int nFence[k_nExtSlots] = { -1, -1, -1, -1 };
+	uint64_t ulSeq[k_nExtSlots] = {};
+	std::chrono::steady_clock::time_point tCommitDone[k_nExtSlots], tSubmitted[k_nExtSlots];
+	double flSubmitMs[k_nExtSlots] = {};
+	bool bEarly[k_nExtSlots] = {};
+	uint64_t ulNextSeq = 1;
+	int nShown = -1, nRetiring = -1;
+
+	struct CommitDone_t { std::chrono::steady_clock::time_point t; uint64_t ulCommit = 0; bool bPublished = false; };
+	std::unordered_map<const void *, CommitDone_t> commitDone;
+
+	std::chrono::steady_clock::time_point windowStart;
+	uint64_t ulWindowComposites = 0, ulWindowShown = 0, ulWindowSubmits = 0, ulWindowEarly = 0, ulWindowLate = 0, ulWindowSkipped = 0;
+	double flWindowCommitMs = 0.0, flWindowLateMs = 0.0, flWindowJobMs = 0.0;
+};
+static ExtUpscaleState_t s_ext;
+static_assert( k_nExtSlots == 4, "nFence initializer" );
+
+static int ExtInflight()
+{
+	int n = 0;
+	for ( uint32_t i = 0; i < k_nExtSlots; i++ )
+		n += s_ext.eSlot[i] == ExtSlot_t::Inflight;
+	return n;
+}
+
+// Waits for every job in flight and frees all slots: before the textures are replaced.
+static void ExtDrainAll()
+{
+	for ( uint32_t i = 0; i < k_nExtSlots; i++ )
+	{
+		if ( s_ext.nFence[i] >= 0 )
+		{
+			struct pollfd pfd = { s_ext.nFence[i], POLLIN, 0 };
+			poll( &pfd, 1, 1000 );
+			close( s_ext.nFence[i] );
+		}
+		s_ext.nFence[i] = -1;
+		s_ext.eSlot[i] = ExtSlot_t::Free;
+	}
+	s_ext.nShown = s_ext.nRetiring = -1;
+}
+
+static bool ExtPoll( int i, double flTimeoutMs );
+static int ExtAcquire()
+{
+	for ( uint32_t i = 0; i < k_nExtSlots; i++ )
+		ExtPoll( int( i ), 0.0 );
+	if ( ExtInflight() >= int( k_nExtInflight ) )
+		return -1;
+	for ( uint32_t i = 0; i < k_nExtSlots; i++ )
+		if ( s_ext.eSlot[i] == ExtSlot_t::Free )
+			return int( i );
+	// A finished result nobody showed yet is older than the one about to be submitted.
+	int nOldest = -1;
+	for ( uint32_t i = 0; i < k_nExtSlots; i++ )
+		if ( s_ext.eSlot[i] == ExtSlot_t::Ready && ( nOldest < 0 || s_ext.ulSeq[i] < s_ext.ulSeq[nOldest] ) )
+			nOldest = int( i );
+	return nOldest;
+}
+
+// Asks for a composite when a job finishes, so a result does not wait for the
+// next commit to be shown. Owns the fd it is given.
+static void ExtWatchFence( int nFence, uint64_t ulId )
+{
+	static std::mutex mutex;
+	static std::condition_variable cv;
+	static std::deque<std::pair<int, uint64_t>> fds;
+	static std::thread watcher( []
+	{
+		pthread_setname_np( pthread_self(), "gamescope-extwatch" );
+		for ( ;; )
+		{
+			int fd;
+			uint64_t ulFenceId;
+			{
+				std::unique_lock lock( mutex );
+				cv.wait( lock, [] { return !fds.empty(); } );
+				std::tie( fd, ulFenceId ) = fds.front();
+				fds.pop_front();
+			}
+			struct pollfd pfd = { fd, POLLIN, 0 };
+			poll( &pfd, 1, 1000 );
+			close( fd );
+			upscale_trace( ulFenceId, "fence_seen" );
+			// force_repaint(), not hasRepaint+nudge: a repaint raised while a paint is already
+			// in flight must not be cleared by that paint's own hasRepaint reset.
+			force_repaint();
+		}
+	} );
+	{
+		std::unique_lock lock( mutex );
+		fds.push_back( { nFence, ulId } );
+	}
+	cv.notify_one();
+}
+
+// Non-blocking (flTimeoutMs 0) or bounded wait on slot i's fence; true once it is Ready.
+static bool ExtPoll( int i, double flTimeoutMs )
+{
+	if ( s_ext.eSlot[i] != ExtSlot_t::Inflight )
+		return s_ext.eSlot[i] == ExtSlot_t::Ready;
+	if ( s_ext.nFence[i] >= 0 )
+	{
+		struct pollfd pfd = { s_ext.nFence[i], POLLIN, 0 };
+		if ( poll( &pfd, 1, int( std::ceil( flTimeoutMs ) ) ) <= 0 )
+			return false;
+		close( s_ext.nFence[i] );
+		s_ext.nFence[i] = -1;
+	}
+	s_ext.eSlot[i] = ExtSlot_t::Ready;
+	s_ext.flWindowJobMs += ms_between( s_ext.tSubmitted[i], std::chrono::steady_clock::now() );
+	return true;
+}
+
+// Picks the first format entry gamescope can actually serve: BGRA8 unpadded (cs_readback_bgra) or the
+// Y8-in/NV12-out padded pair (cs_readback_y_padded at the plugin's pad_x/pad_y, cs_readback_uv).
+// Also enforces "linear always allowed": a plane/fourcc match at a non-LINEAR modifier is skipped
+// in favor of a later LINEAR entry for the same plane, since gamescope only ever exports LINEAR
+// (ext_update_images always sets bLinear = true) -- a plugin that lists ONLY a tiled modifier for
+// its preferred plane is correctly declined here instead of silently handed a linear buffer.
+static bool ExtPickFormat( const gs_upscaler_negotiate_result_t &neg, ExtPlaneMode_t &outMode, bool &outModifierMismatch )
+{
+	outModifierMismatch = false;
+	bool bBgra8ModifierMismatch = false, bY8ModifierMismatch = false;
+	for ( uint32_t i = 0; i < neg.format_count; i++ )
+	{
+		const auto &fmt = neg.formats[i];
+		if ( fmt.plane == GS_UPSCALER_PLANE_BGRA8 && fmt.drm_fourcc == DRM_FORMAT_ARGB8888 && fmt.pad_x == 0 && fmt.pad_y == 0 )
+		{
+			if ( fmt.drm_modifier != DRM_FORMAT_MOD_LINEAR ) { bBgra8ModifierMismatch = true; continue; }
+			outMode = ExtPlaneMode_t::Bgra8Unpadded;
+			return true;
+		}
+		if ( fmt.plane == GS_UPSCALER_PLANE_Y8_NV12_OUT && fmt.drm_fourcc == DRM_FORMAT_R8 &&
+		     fmt.padded_w && fmt.padded_h && fmt.out_padded_w && fmt.out_padded_h )
+		{
+			if ( fmt.drm_modifier != DRM_FORMAT_MOD_LINEAR ) { bY8ModifierMismatch = true; continue; }
+			outMode = ExtPlaneMode_t::Y8Nv12Padded;
+			s_ext.inPadW = fmt.padded_w; s_ext.inPadH = fmt.padded_h;
+			s_ext.outPadW = fmt.out_padded_w; s_ext.outPadH = fmt.out_padded_h;
+			s_ext.padX = fmt.pad_x; s_ext.padY = fmt.pad_y;
+			return true;
+		}
+	}
+	outModifierMismatch = bBgra8ModifierMismatch || bY8ModifierMismatch;
+	return false;
+}
+
+static bool ext_negotiate( uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH, bool bHDR )
+{
+	gs_upscaler_negotiate_desc_t desc = {};
+	desc.size = sizeof( desc );
+	desc.in_w = inW; desc.in_h = inH;
+	desc.out_w = outW; desc.out_h = outH;
+	desc.colorspace = GS_UPSCALER_COLORSPACE_SRGB;
+	// The frame-build gate (useExternalLayer0 in steamcompmgr.cpp) already keeps an HDR layer out of
+	// this path, so bHDR is expected false here -- carried through for real (not hardcoded) so a
+	// v1 plugin's own decline still holds if a future caller skips that gate.
+	desc.hdr = bHDR;
+	desc.sharpness = float( g_upscaleFilterSharpness );
+	if ( !EU::Negotiate( desc, s_ext.negotiation ) )
+		return false;
+	if ( !s_ext.negotiation.scale_num || !s_ext.negotiation.scale_den )
+	{
+		vk_log.infof( "external: plugin accepted with scale %u/%u", s_ext.negotiation.scale_num, s_ext.negotiation.scale_den );
+		return false;
+	}
+
+	bool bModifierMismatch = false;
+	if ( !ExtPickFormat( s_ext.negotiation, s_ext.mode, bModifierMismatch ) )
+	{
+		vk_log.infof( "external: plugin accepted the size but %s (%u format(s) offered)",
+			bModifierMismatch ? "only offered a non-linear modifier gamescope can't produce" : "none of its formats is a plane gamescope can serve",
+			s_ext.negotiation.format_count );
+		return false;
+	}
+	s_ext.inW = inW; s_ext.inH = inH; s_ext.outW = outW; s_ext.outH = outH;
+	return true;
+}
+
+static bool ext_update_images( uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH, bool bHDR )
+{
+	if ( s_ext.pIn[0] && s_ext.inW == inW && s_ext.inH == inH && s_ext.outW == outW && s_ext.outH == outH )
+		return true;
+	// A decline holds until the sizes change; asking again every frame only repeats it.
+	static std::array<uint32_t, 5> s_declined = {};
+	const std::array<uint32_t, 5> key = { inW, inH, outW, outH, bHDR };
+	if ( key == s_declined )
+		return false;
+	ExtDrainAll();
+	if ( !ext_negotiate( inW, inH, outW, outH, bHDR ) )
+	{
+		s_declined = key;
+		return false;
+	}
+	s_declined = {};
+
+	// Linear, not whatever RADV would prefer for perf: cross-device import (the ABI's second-device
+	// case) can't assume a plugin understands this GPU's tiled modifier, and negotiate()'s answer
+	// promised "linear always allowed" -- keep that promise on the gamescope side too.
+	// Mappable: an importer may need to CPU-map the dma-buf (amdxdna's import does, and fails with
+	// EPERM on non-host-visible memory).
+	CVulkanTexture::createFlags inFlags;
+	inFlags.bStorage = true;
+	inFlags.bExportable = true;
+	inFlags.bLinear = true;
+	inFlags.bMappable = true;
+	CVulkanTexture::createFlags outFlags;
+	outFlags.bSampled = true;
+	outFlags.bExportable = true;
+	outFlags.bLinear = true;
+	outFlags.bMappable = true;
+
+	for ( uint32_t i = 0; i < k_nExtSlots; i++ )
+	{
+		s_ext.pIn[i] = new CVulkanTexture();
+		s_ext.pOut[i] = new CVulkanTexture();
+		if ( s_ext.mode == ExtPlaneMode_t::Bgra8Unpadded )
+		{
+			if ( !s_ext.pIn[i]->BInit( inW, inH, 1u, DRM_FORMAT_ARGB8888, inFlags ) ||
+			     !s_ext.pOut[i]->BInit( outW, outH, 1u, DRM_FORMAT_ARGB8888, outFlags ) )
+				return false;
+		}
+		else // Y8Nv12Padded
+		{
+			CVulkanTexture::createFlags yOutFlags = outFlags;
+			yOutFlags.bStorage = true; // the plugin writes plane 0 (Y) directly, not sampled from
+			if ( !s_ext.pIn[i]->BInit( s_ext.inPadW, s_ext.inPadH, 1u, DRM_FORMAT_R8, inFlags ) ||
+			     !s_ext.pOut[i]->BInit( s_ext.outPadW, s_ext.outPadH, 1u, DRM_FORMAT_NV12, yOutFlags ) )
+				return false;
+		}
+		if ( s_ext.pIn[i]->dmabuf().n_planes != 1 || s_ext.pOut[i]->dmabuf().n_planes != 1 )
+		{
+			vk_log.errorf( "external: exported textures are not single-plane" );
+			return false;
+		}
+	}
+	return true;
+}
+
+static VkSemaphore ExtReadDoneSemaphore( int i )
+{
+	if ( s_ext.pReadDone[i] != VK_NULL_HANDLE )
+		return s_ext.pReadDone[i];
+	VkExportSemaphoreCreateInfo exportInfo = {
+		.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+		.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+	};
+	VkSemaphoreCreateInfo createInfo = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+		.pNext = &exportInfo,
+	};
+	VkResult res = g_device.vk.CreateSemaphore( g_device.device(), &createInfo, nullptr, &s_ext.pReadDone[i] );
+	if ( res != VK_SUCCESS )
+	{
+		vk_errorf( res, "external: vkCreateSemaphore (sync_file export) failed" );
+		s_ext.pReadDone[i] = VK_NULL_HANDLE;
+	}
+	return s_ext.pReadDone[i];
+}
+
+// Reads pTex back into slot i's input (and, for Y8Nv12Padded, the output's chroma plane, which the
+// plugin never writes), then submits it. Returns false on a
+// hard plugin failure.
+static bool ExtSubmitSlot( int i, gamescope::Rc<CVulkanTexture> pTex, std::chrono::steady_clock::time_point tCommitDone, bool bEarly )
+{
+	auto readCmd = g_device.commandBuffer();
+	for ( uint32_t j = 0; j < EOTF_Count; j++ )
+		readCmd->bindColorMgmtLuts( j, nullptr, nullptr );
+	auto bindSource = [&]()
+	{
+		readCmd->bindTexture( 0, pTex );
+		readCmd->setTextureSrgb( 0, true );
+		readCmd->setSamplerUnnormalized( 0, false );
+		readCmd->setSamplerNearest( 0, true );
+		for ( uint32_t j = 1; j < VKR_SAMPLER_SLOTS; j++ )
+			readCmd->bindTexture( j, nullptr );
+	};
+	const bool bY = s_ext.mode == ExtPlaneMode_t::Y8Nv12Padded;
+	if ( !bY )
+	{
+		readCmd->bindPipeline( g_device.pipeline( SHADER_TYPE_READBACK_BGRA ) );
+		readCmd->bindTarget( s_ext.pIn[i].get() );
+		bindSource();
+		readCmd->dispatch( div_roundup( s_ext.inW, 8 ), div_roundup( s_ext.inH, 8 ) );
+	}
+	else
+	{
+		readCmd->bindPipeline( g_device.pipeline( SHADER_TYPE_READBACK_Y_PADDED ) );
+		readCmd->bindTarget( s_ext.pIn[i].get() );
+		bindSource();
+		readCmd->uploadConstants<ReadbackPadPushData_t>( s_ext.padX, s_ext.padY );
+		readCmd->dispatch( div_roundup( s_ext.inPadW, 8 ), div_roundup( s_ext.inPadH, 8 ) );
+
+		readCmd->bindPipeline( g_device.pipeline( SHADER_TYPE_READBACK_UV ) );
+		readCmd->bindTarget( s_ext.pOut[i].get() );
+		bindSource();
+		readCmd->uploadConstants<ReadbackScalePushData_t>( s_ext.negotiation.scale_num, s_ext.negotiation.scale_den );
+		readCmd->dispatch( div_roundup( s_ext.outPadW / 2, 8 ), div_roundup( s_ext.outPadH / 2, 8 ) );
+	}
+	// The plugin waits for the readback on its own side through a sync_file, so the compositor
+	// thread never blocks on the GPU here. GAMESCOPE_EXTERNAL_IN_FENCE=0 waits here instead.
+	static const bool bInFence = !getenv( "GAMESCOPE_EXTERNAL_IN_FENCE" ) || atoi( getenv( "GAMESCOPE_EXTERNAL_IN_FENCE" ) ) != 0;
+	const VkSemaphore pReadDone = bInFence ? ExtReadDoneSemaphore( i ) : VK_NULL_HANDLE;
+	if ( pReadDone != VK_NULL_HANDLE )
+		readCmd->AddBinarySignal( pReadDone );
+	const uint64_t ulId = s_ext.ulNextSeq;
+	upscale_trace( ulId, "commit", trace_ns( tCommitDone ) );
+	const uint64_t ulGpuSeq = g_device.submit( std::move( readCmd ) );
+	upscale_trace( ulId, "rb_submit" );
+	int nInFence = -1;
+	const bool bWait = pReadDone == VK_NULL_HANDLE;
+	if ( !bWait )
+	{
+		// -1 with VK_SUCCESS: already signalled, nothing to wait for.
+		const VkSemaphoreGetFdInfoKHR getFdInfo = {
+			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+			.semaphore = pReadDone,
+			.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+		};
+		VkResult res = g_device.vk.GetSemaphoreFdKHR( g_device.device(), &getFdInfo, &nInFence );
+		if ( res != VK_SUCCESS )
+		{
+			// The semaphore keeps its payload; wait it out and make a fresh one for the next use.
+			vk_errorf( res, "external: vkGetSemaphoreFdKHR (sync_file) failed" );
+			g_device.wait( ulGpuSeq );
+			g_device.vk.DestroySemaphore( g_device.device(), pReadDone, nullptr );
+			s_ext.pReadDone[i] = VK_NULL_HANDLE;
+			nInFence = -1;
+		}
+	}
+	if ( bWait )
+	{
+		g_device.wait( ulGpuSeq );
+		upscale_trace( ulId, "rb_done" );
+	}
+
+	gs_upscaler_submit_t submit = {};
+	submit.size = sizeof( submit );
+	submit.in.size = sizeof( submit.in );
+	submit.in.fd = s_ext.pIn[i]->dmabuf().fd[0];
+	submit.in.width = bY ? s_ext.inPadW : s_ext.inW;
+	submit.in.height = bY ? s_ext.inPadH : s_ext.inH;
+	submit.in.drm_fourcc = bY ? DRM_FORMAT_R8 : DRM_FORMAT_ARGB8888;
+	submit.in.stride = s_ext.pIn[i]->dmabuf().stride[0];
+	submit.out.size = sizeof( submit.out );
+	submit.out.fd = s_ext.pOut[i]->dmabuf().fd[0];
+	submit.out.width = bY ? s_ext.outPadW : s_ext.outW;
+	submit.out.height = bY ? s_ext.outPadH : s_ext.outH;
+	submit.out.drm_fourcc = bY ? DRM_FORMAT_NV12 : DRM_FORMAT_ARGB8888;
+	submit.out.stride = s_ext.pOut[i]->dmabuf().stride[0];
+	submit.in_fence_fd = nInFence;
+
+	const auto tSubmit = std::chrono::steady_clock::now();
+	const int nFence = EU::Submit( submit );
+	const auto tReturned = std::chrono::steady_clock::now();
+	if ( nInFence >= 0 )
+		close( nInFence ); // borrowed for the call only
+	upscale_trace( ulId, "submitted", trace_ns( tReturned ) );
+	if ( nFence == -2 )
+	{
+		vk_log.errorf( "external: submit() hard-failed, falling back to FSR" );
+		s_ext.bLoaded = false;
+		return false;
+	}
+	if ( nFence >= 0 )
+	{
+		const int nWatch = fcntl( nFence, F_DUPFD_CLOEXEC, 0 );
+		if ( nWatch >= 0 )
+			ExtWatchFence( nWatch, ulId );
+	}
+	s_ext.eSlot[i] = nFence >= 0 ? ExtSlot_t::Inflight : ExtSlot_t::Ready;
+	s_ext.nFence[i] = nFence;
+	s_ext.ulSeq[i] = s_ext.ulNextSeq++;
+	s_ext.tCommitDone[i] = tCommitDone;
+	s_ext.tSubmitted[i] = tSubmit;
+	s_ext.flSubmitMs[i] = ms_between( tSubmit, tReturned );
+	s_ext.bEarly[i] = bEarly;
+	s_ext.ulWindowSubmits++;
+	if ( nFence < 0 )
+		s_ext.flWindowJobMs += s_ext.flSubmitMs[i];
+	return true;
+}
+
+// Commit-done hook: reads back and submits a focused window's frame when its commit is done. The first frame at a new size still
+// goes through the composite, which negotiates (negotiate() needs the output size this hook lacks).
+void vulkan_external_on_game_frame( gamescope::Rc<CVulkanTexture> pTex, uint64_t ulCommit )
+{
+	static const bool bEarly = !getenv( "GAMESCOPE_EXTERNAL_EARLY" ) || atoi( getenv( "GAMESCOPE_EXTERNAL_EARLY" ) ) != 0;
+	if ( pTex == nullptr )
+		return;
+	if ( s_ext.commitDone.size() > 16 )
+		s_ext.commitDone.clear();
+	auto &done = s_ext.commitDone[ pTex.get() ];
+	if ( done.ulCommit != ulCommit )
+		done = { std::chrono::steady_clock::now(), ulCommit, false };
+	if ( !bEarly || !s_ext.bLoaded || done.bPublished || !s_ext.pIn[0] || pTex->width() != s_ext.inW || pTex->height() != s_ext.inH )
+		return;
+	const int i = ExtAcquire();
+	if ( i < 0 )
+	{
+		s_ext.ulWindowSkipped++;
+		return;
+	}
+	if ( ExtSubmitSlot( i, pTex, done.t, true ) )
+	{
+		done.bPublished = true;
+		s_ext.ulWindowEarly++;
+	}
+}
+
+// vulkan_external_result_pending: the shown layer 0 was already submitted to the
+// plugin and no slot is Ready yet -- skip this composite (it would just recomposite the old
+// output) and let ExtWatchFence's own force_repaint() bring the composite once a slot finishes.
+static bool ExtResultPending( const CVulkanTexture *pLayer0 )
+{
+	auto itDone = s_ext.commitDone.find( pLayer0 );
+	if ( itDone == s_ext.commitDone.end() || !itDone->second.bPublished )
+		return false;
+	bool bInflight = false;
+	for ( uint32_t i = 0; i < k_nExtSlots; i++ )
+	{
+		ExtPoll( int( i ), 0.0 ); // a finished job is only Ready once its fence is polled
+		if ( s_ext.eSlot[i] == ExtSlot_t::Ready )
+			return false;
+		bInflight |= s_ext.eSlot[i] == ExtSlot_t::Inflight;
+	}
+	return bInflight;
+}
+
+static bool vulkan_external_upscale_layer0( struct FrameInfo_t *frameInfo, CVulkanCmdBuffer *cmdBuffer, gamescope::Rc<CVulkanTexture> compositeImage, EOTF outputTF )
+{
+	if ( frameInfo->ycbcrMask() & 1 )
+		return false;
+	if ( !s_ext.bTriedLoad )
+	{
+		s_ext.bTriedLoad = true;
+		s_ext.bLoaded = EU::Load( g_sExternalUpscalerSpec, g_sExternalUpscalerConfig );
+		s_ext.windowStart = std::chrono::steady_clock::now();
+	}
+	if ( !s_ext.bLoaded )
+		return false;
+
+	static uint64_t ulExtFrame = 0;
+	static const bool bLog = getenv( "GAMESCOPE_EXTERNAL_LOG" ) && atoi( getenv( "GAMESCOPE_EXTERNAL_LOG" ) );
+	static const double flLateMs = getenv( "GAMESCOPE_EXTERNAL_LATE_MS" ) ? atof( getenv( "GAMESCOPE_EXTERNAL_LATE_MS" ) ) : 1.0;
+
+	gamescope::Rc<CVulkanTexture> pLayer0 = frameInfo->layers.get( 0 ).tex;
+	const uint32_t inW = pLayer0->width();
+	const uint32_t inH = pLayer0->height();
+	const uint32_t outW = frameInfo->layers.get( 0 ).integerWidth();
+	const uint32_t outH = frameInfo->layers.get( 0 ).integerHeight();
+	if ( !ext_update_images( inW, inH, outW, outH, ColorspaceIsHDR( frameInfo->layers.get( 0 ).colorspace ) ) )
+		return false;
+
+	// The latched frame, if neither path submitted it yet (early start off, the hook was at its
+	// in-flight limit, or this is the first frame at this size) and nothing newer is pending.
+	auto itDone = s_ext.commitDone.find( pLayer0.get() );
+	const bool bKnown = itDone != s_ext.commitDone.end();
+	bool bPending = false;
+	for ( uint32_t i = 0; i < k_nExtSlots; i++ )
+		bPending |= s_ext.eSlot[i] == ExtSlot_t::Inflight || s_ext.eSlot[i] == ExtSlot_t::Ready;
+	if ( ( !bKnown || !itDone->second.bPublished ) && !bPending )
+	{
+		const int i = ExtAcquire();
+		if ( i >= 0 )
+		{
+			if ( !ExtSubmitSlot( i, pLayer0, bKnown ? itDone->second.t : std::chrono::steady_clock::now(), false ) )
+				return false;
+			if ( bKnown )
+				itDone->second.bPublished = true;
+		}
+	}
+
+	// Newest finished slot; wait briefly for the oldest in flight if none is newer than the shown one
+	// (or, before anything was ever shown, for up to a second).
+	auto newestReady = [&]()
+	{
+		int n = -1;
+		for ( uint32_t i = 0; i < k_nExtSlots; i++ )
+		{
+			ExtPoll( int( i ), 0.0 );
+			if ( s_ext.eSlot[i] == ExtSlot_t::Ready && ( n < 0 || s_ext.ulSeq[i] > s_ext.ulSeq[n] ) )
+				n = int( i );
+		}
+		return n;
+	};
+	int nReady = newestReady();
+	if ( nReady < 0 && ExtInflight() > 0 )
+	{
+		int nOldest = -1;
+		for ( uint32_t i = 0; i < k_nExtSlots; i++ )
+			if ( s_ext.eSlot[i] == ExtSlot_t::Inflight && ( nOldest < 0 || s_ext.ulSeq[i] < s_ext.ulSeq[nOldest] ) )
+				nOldest = int( i );
+		const auto tWait = std::chrono::steady_clock::now();
+		if ( ExtPoll( nOldest, s_ext.nShown < 0 ? 1000.0 : flLateMs ) )
+		{
+			s_ext.ulWindowLate++;
+			s_ext.flWindowLateMs += ms_between( tWait, std::chrono::steady_clock::now() );
+			nReady = newestReady();
+		}
+	}
+	if ( nReady >= 0 )
+	{
+		const auto now = std::chrono::steady_clock::now();
+		for ( uint32_t i = 0; i < k_nExtSlots; i++ )
+			if ( s_ext.eSlot[i] == ExtSlot_t::Ready && int( i ) != nReady )
+				s_ext.eSlot[i] = ExtSlot_t::Free; // older than the one shown now
+		if ( s_ext.nRetiring >= 0 )
+			s_ext.eSlot[ s_ext.nRetiring ] = ExtSlot_t::Free;
+		s_ext.nRetiring = s_ext.nShown;
+		if ( s_ext.nRetiring >= 0 )
+			s_ext.eSlot[ s_ext.nRetiring ] = ExtSlot_t::Retiring;
+		s_ext.nShown = nReady;
+		s_ext.eSlot[ nReady ] = ExtSlot_t::Shown;
+		const double flCommitMs = ms_between( s_ext.tCommitDone[nReady], now );
+		upscale_trace( s_ext.ulSeq[nReady], "take", trace_ns( now ) );
+		upscale_trace_set_shown( s_ext.ulSeq[nReady] );
+		s_ext.ulWindowShown++;
+		s_ext.flWindowCommitMs += flCommitMs;
+		if ( bLog )
+			vk_log.infof( "external frame %" PRIu64 " (%s): submit() blocked caller %.3f ms, submit -> shown %.3f ms, commit done -> shown %.3f ms",
+				ulExtFrame++, s_ext.bEarly[nReady] ? "early" : "composite", s_ext.flSubmitMs[nReady],
+				ms_between( s_ext.tSubmitted[nReady], now ), flCommitMs );
+	}
+
+	const auto now = std::chrono::steady_clock::now();
+	s_ext.ulWindowComposites++;
+	const double flWindowMs = ms_between( s_ext.windowStart, now );
+	if ( flWindowMs >= 5000.0 )
+	{
+		const double n = std::max<uint64_t>( s_ext.ulWindowShown, 1 );
+		vk_log.infof( "external latest: display %.1f fps, shown %.1f /s, submits %.1f /s (%" PRIu64 " at commit, %" PRIu64 " skipped at the in-flight limit); mean submit -> seen done %.2f ms; late waits %" PRIu64 ", %.2f ms each; commit done -> shown %.2f ms",
+			s_ext.ulWindowComposites * 1000.0 / flWindowMs, s_ext.ulWindowShown * 1000.0 / flWindowMs, s_ext.ulWindowSubmits * 1000.0 / flWindowMs,
+			s_ext.ulWindowEarly, s_ext.ulWindowSkipped, s_ext.flWindowJobMs / std::max<uint64_t>( s_ext.ulWindowSubmits, 1 ),
+			s_ext.ulWindowLate, s_ext.ulWindowLate ? s_ext.flWindowLateMs / s_ext.ulWindowLate : 0.0, s_ext.flWindowCommitMs / n );
+		s_ext.windowStart = now;
+		s_ext.ulWindowComposites = s_ext.ulWindowShown = s_ext.ulWindowSubmits = s_ext.ulWindowEarly = s_ext.ulWindowLate = s_ext.ulWindowSkipped = 0;
+		s_ext.flWindowCommitMs = s_ext.flWindowLateMs = s_ext.flWindowJobMs = 0.0;
+	}
+
+	if ( s_ext.nShown < 0 )
+		return false;
+	gamescope::Rc<CVulkanTexture> pOut = s_ext.pOut[ s_ext.nShown ].get();
+	if ( s_ext.mode == ExtPlaneMode_t::Bgra8Unpadded )
+	{
+		struct FrameInfo_t extFrameInfo = *frameInfo;
+		extFrameInfo.layers.get( 0 ).tex = pOut;
+		extFrameInfo.layers.get( 0 ).scale.x = 1.0f;
+		extFrameInfo.layers.get( 0 ).scale.y = 1.0f;
+		cmdBuffer->bindPipeline( g_device.pipeline( SHADER_TYPE_BLIT, extFrameInfo.layers.count(), extFrameInfo.ycbcrMask(), 0u, extFrameInfo.colorspaceMask(), outputTF ) );
+		bind_all_layers( cmdBuffer, &extFrameInfo );
+		cmdBuffer->bindTarget( compositeImage );
+		cmdBuffer->uploadConstants<BlitPushData_t>( &extFrameInfo );
+		cmdBuffer->dispatch( div_roundup( currentOutputWidth, 8 ), div_roundup( currentOutputHeight, 8 ) );
+	}
+	else
+	{
+		// Padded NV12 output: composite_upscaled_layer0 handles "texture bigger than the shown size" and the
+		// YCbCr gamma-decode fixup.
+		composite_upscaled_layer0( frameInfo, cmdBuffer, compositeImage, outputTF, pOut, float( s_ext.negotiation.scale_num ) / float( s_ext.negotiation.scale_den ) );
+	}
+	return true;
+}
+
 std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamescope::Rc<CVulkanTexture> pPipewireTexture, bool partial, gamescope::Rc<CVulkanTexture> pOutputOverride, bool increment, std::unique_ptr<CVulkanCmdBuffer> pInCommandBuffer )
 {
+	// Composite rate for every filter (-F linear is the control for -F external's own counters).
+	{
+		static uint64_t s_ulComposites = 0, s_ulNewFrames = 0;
+		static const CVulkanTexture *s_pLastLayer0 = nullptr;
+		static auto s_windowStart = std::chrono::steady_clock::now();
+		s_ulComposites++;
+		if ( frameInfo->layers.count() > 0 && frameInfo->layers.get( 0 ).tex.get() != s_pLastLayer0 )
+		{
+			s_ulNewFrames++;
+			s_pLastLayer0 = frameInfo->layers.get( 0 ).tex.get();
+		}
+		auto now = std::chrono::steady_clock::now();
+		double flMs = std::chrono::duration<double, std::milli>( now - s_windowStart ).count();
+		if ( flMs >= 5000.0 )
+		{
+			vk_log.infof( "composite: %.1f fps, new layer-0 buffers %.1f /s over %.1f s", s_ulComposites * 1000.0 / flMs, s_ulNewFrames * 1000.0 / flMs, flMs / 1000.0 );
+			s_ulComposites = 0;
+			s_ulNewFrames = 0;
+			s_windowStart = now;
+		}
+	}
 	EOTF outputTF = frameInfo->outputEncodingEOTF;
 	if (!frameInfo->applyOutputColorMgmt)
 		outputTF = EOTF_Count; //Disable blending stuff.
@@ -4364,7 +5120,10 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	for (uint32_t i = 0; i < EOTF_Count; i++)
 		cmdBuffer->bindColorMgmtLuts(i, frameInfo->shaperLut[i], frameInfo->lut3D[i]);
 
-	if ( frameInfo->useFSRLayer0 || frameInfo->useSGSRLayer0 )
+	if ( frameInfo->useExternalLayer0 && vulkan_external_upscale_layer0( frameInfo, cmdBuffer.get(), compositeImage, outputTF ) )
+	{
+	}
+	else if ( frameInfo->useFSRLayer0 || frameInfo->useSGSRLayer0 || frameInfo->useExternalLayer0 )
 	{
 		uint32_t inputX = frameInfo->layers.get( 0 ).tex->width();
 		uint32_t inputY = frameInfo->layers.get( 0 ).tex->height();
@@ -4577,7 +5336,9 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 
 	if ( !GetBackend()->UsesVulkanSwapchain() && pOutputOverride == nullptr && increment )
 	{
-		g_output.nOutImage = ( g_output.nOutImage + 1 ) % 3;
+		g_output.nPrevOutImage = g_output.nLastOutImage;
+		g_output.nLastOutImage = g_output.nOutImage;
+		g_output.nOutImage = ( g_output.nOutImage + 1 ) % g_output.outputImages.size();
 	}
 
 	return sequence;
@@ -4631,19 +5392,8 @@ bool vulkan_format_supports_features(VkFormat format, VkFormatFeatureFlags featu
 
 gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool defer )
 {
-	// Get previous image ( +2 )
-	// 1 2 3
-	//   |
-	// |
-	uint32_t nRegularImage = ( g_output.nOutImage + 2 ) % 3;
-
-	// Get previous previous image ( +1 )
-	// 1 2 3
-	//   |
-	//     |
-	uint32_t nDeferredImage = ( g_output.nOutImage + 1 ) % 3;
-
-	uint32_t nOutImage = defer ? nDeferredImage : nRegularImage;
+	// defer: the image before the last one.
+	uint32_t nOutImage = defer ? g_output.nPrevOutImage : g_output.nLastOutImage;
 
 	if ( partial )
 	{
@@ -4654,6 +5404,60 @@ gamescope::Rc<CVulkanTexture> vulkan_get_last_output_image( bool partial, bool d
 
 
 	return g_output.outputImages[ nOutImage ];
+}
+
+static bool vulkan_output_image_held( CVulkanTexture *pTex )
+{
+	if ( pTex->IsInUse() )
+		return true;
+
+	// The host may have released the wl_buffer with its own GPU reads of it still queued: those sit
+	// as implicit fences on the dma-buf, which our Vulkan writes do not wait for.
+	const int nFd = pTex->dmabuf().fd[0];
+	if ( nFd < 0 )
+		return false;
+	dma_buf_export_sync_file req = { .flags = DMA_BUF_SYNC_WRITE, .fd = -1 };
+	if ( drmIoctl( nFd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &req ) != 0 )
+		return false;
+	pollfd pfd = { .fd = req.fd, .events = POLLIN, .revents = 0 };
+	const bool bBusy = poll( &pfd, 1, 0 ) == 0;
+	close( req.fd );
+	return bBusy;
+}
+
+bool vulkan_select_free_output_image( uint32_t uMaxImages, uint32_t *puImages, uint32_t *puHeld )
+{
+	const uint32_t uImages = g_output.outputImages.size();
+	uint32_t uHeld = 0;
+	std::optional<uint32_t> oFree;
+	for ( uint32_t i = 0; i < uImages; i++ )
+	{
+		const uint32_t n = ( g_output.nOutImage + i ) % uImages;
+		if ( vulkan_output_image_held( g_output.outputImages[n].get() ) )
+			uHeld++;
+		else if ( !oFree )
+			oFree = n;
+	}
+	*puHeld = uHeld;
+
+	if ( !oFree && uImages < uMaxImages )
+	{
+		gamescope::OwningRc<CVulkanTexture> pImage = new CVulkanTexture();
+		if ( pImage->BInit( g_nOutputWidth, g_nOutputHeight, 1u, g_output.uOutputFormat, vulkan_output_image_flags() ) )
+		{
+			g_output.outputImages.emplace_back( std::move( pImage ) );
+			g_output.outputImagesPartialOverlay.emplace_back( nullptr );
+			oFree = uImages;
+		}
+		else
+			vk_log.errorf( "failed to add output image %u", uImages );
+	}
+
+	*puImages = g_output.outputImages.size();
+	if ( !oFree )
+		return false;
+	g_output.nOutImage = *oFree;
+	return true;
 }
 
 bool vulkan_primary_dev_id(dev_t *id)
