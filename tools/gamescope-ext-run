@@ -40,7 +40,9 @@ in $conf. In Steam's launch options: $self %command%
   --KEY VALUE          set a profile key for this run, over the config file:
       --output O         your screen: auto (default),  --scale N or N/M   output / game size
                          a name like DP-2, or WxH
-      --input WxH        the game's size, not scale    --filter F         a -F value, e.g. fsr,
+      --scale game       the game picks its size in    --filter F         a -F value, e.g. fsr,
+                         its own menu (screen = native)
+      --input WxH        the game's size, not scale
       --sharpness 0-20   0 is sharpest                    external:<plugin>[:config]
       --refresh HZ       -r; default: the screen's rate  --fullscreen 0|1
       --hdr 0|1          --hdr-enabled                 --args "..."       more gamescope arguments
@@ -190,8 +192,13 @@ if [ -n "${cfg[input]:-}" ]; then
 	[[ ${cfg[input]} =~ ^([0-9]+)x([0-9]+)$ ]] || fail "input must be WIDTHxHEIGHT, got '${cfg[input]}'"
 	in_w=${BASH_REMATCH[1]}
 	in_h=${BASH_REMATCH[2]}
+elif [ "${cfg[scale]}" = game ]; then
+	# The game sees the whole screen as its native mode and picks its render size in its own menu;
+	# gamescope upscales whatever it draws, so the plugin meets the ratio only at run time.
+	in_w=$out_w
+	in_h=$out_h
 else
-	[[ ${cfg[scale]} =~ ^([0-9]+)(/([0-9]+))?$ ]] || fail "scale must be N or N/M, got '${cfg[scale]}'"
+	[[ ${cfg[scale]} =~ ^([0-9]+)(/([0-9]+))?$ ]] || fail "scale must be N, N/M or game, got '${cfg[scale]}'"
 	num=${BASH_REMATCH[1]}
 	den=${BASH_REMATCH[3]:-1}
 	in_w=$(( (out_w * den + num / 2) / num ))
@@ -216,6 +223,7 @@ fi
 # A scale the plugin's manifest does not list for this config is declined at run time, and
 # gamescope then upscales with its own FSR1: say so now rather than only in its log.
 scale=${cfg[scale]}
+[ "$scale" != game ] || scale=
 if [ -n "${cfg[input]:-}" ]; then
 	# The scale an input size implies, as a reduced fraction, or nothing when the axes differ.
 	a=$out_w; b=$in_w

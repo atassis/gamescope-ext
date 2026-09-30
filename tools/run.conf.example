@@ -6,7 +6,9 @@
 # Keys (keys outside a [section], or in [default], apply to every profile):
 #   output      your screen: auto (default; the screen KDE's KWin opens new windows on, at its
 #               current mode), a screen name as kscreen-doctor -o lists it (DP-2), or WIDTHxHEIGHT
-#   scale       output / game size: 2 (default), 3/2, 5/3, 3 ...; the game gets output / scale
+#   scale       output / game size: 2 (default), 3/2, 5/3, 3 ...; the game gets output / scale.
+#               game: the game sees the whole screen as native and its own resolution menu picks
+#               the render size; the upscaler handles that ratio if it can, else gamescope's FSR1.
 #   input       the game's size, WIDTHxHEIGHT, instead of scale
 #   filter      a -F value: fsr (default), nis, sgsr, linear, external:<plugin>[:config]
 #               A bare config name that is a directory inside the installed plugin's own
