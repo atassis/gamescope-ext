@@ -220,8 +220,8 @@ if [[ $filter =~ ^external:([^:/]+):([^/]+)$ ]]; then
 	done
 fi
 
-# A scale the plugin's manifest does not list for this config is declined at run time, and
-# gamescope then upscales with its own FSR1: say so now rather than only in its log.
+# A scale the plugin's manifest does not list for this config is not upscaled exactly: say so now
+# rather than only in its log.
 scale=${cfg[scale]}
 [ "$scale" != game ] || scale=
 if [ -n "${cfg[input]:-}" ]; then
@@ -237,7 +237,7 @@ if [ -n "${manifest:-}" ] && [ -n "$scale" ] && command -v python3 >/dev/null; t
 for c in json.load(open(sys.argv[1])).get("configs", []):
     if c.get("name") == sys.argv[2]: print(" ".join(c.get("scales", [])))' "$manifest" "$config" 2>/dev/null || true)
 	if [ -n "$listed" ] && [[ " $listed " != *" $scale "* ]]; then
-		echo "$self: warning: $config lists scales $listed, not $scale; gamescope will use its own FSR1" >&2
+		echo "$self: warning: $config lists scales $listed, not $scale; the plugin will use a listed scale or decline (see its log)" >&2
 	fi
 fi
 

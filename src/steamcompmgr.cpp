@@ -3233,14 +3233,10 @@ paint_all( global_focus_t *pFocus, bool async )
 
 					bool needsScaling = frameInfo.layers.get( 0 ).scale.x < 0.999f && frameInfo.layers.get( 0 ).scale.y < 0.999f;
 					GamescopeUpscaleFilter eLayer0Filter = ResolveUpscaleFilter( frameInfo.eUpscaleFilter, frameInfo.layers.get( 0 ).colorspace, frameInfo.layers.get( 0 ).isYcbcr() );
-					// A v1 external plugin gets 8 bpc planes (and may decline desc.hdr),
-					// so an HDR layer falls back to GPU FSR instead of quantizing/clipping.
-					bool isHDRLayer0 = ColorspaceIsHDR( frameInfo.layers.get( 0 ).colorspace );
-					frameInfo.useFSRLayer0 = needsScaling && ( eLayer0Filter == GamescopeUpscaleFilter::FSR ||
-						( eLayer0Filter == GamescopeUpscaleFilter::EXTERNAL && isHDRLayer0 ) );
+					frameInfo.useFSRLayer0 = eLayer0Filter == GamescopeUpscaleFilter::FSR && needsScaling;
 					frameInfo.useNISLayer0 = eLayer0Filter == GamescopeUpscaleFilter::NIS && needsScaling;
 					frameInfo.useSGSRLayer0 = eLayer0Filter == GamescopeUpscaleFilter::SGSR && needsScaling;
-					frameInfo.useExternalLayer0 = eLayer0Filter == GamescopeUpscaleFilter::EXTERNAL && needsScaling && !isHDRLayer0;
+					frameInfo.useExternalLayer0 = eLayer0Filter == GamescopeUpscaleFilter::EXTERNAL && needsScaling;
 				}
 				if ( pFocus == GetCurrentMouseFocus() )
 					update_touch_scaling( &frameInfo );

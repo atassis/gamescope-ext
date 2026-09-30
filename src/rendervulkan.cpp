@@ -12,6 +12,7 @@
 #include <deque>
 #include <chrono>
 #include <cinttypes>
+#include <cstdarg>
 #include <climits>
 #include <dlfcn.h>
 #include <poll.h>
@@ -4625,6 +4626,26 @@ static bool ExtPickFormat( const gs_upscaler_negotiate_result_t &neg, ExtPlaneMo
 	return false;
 }
 
+bool g_bExternalUpscalerFailed = false;
+extern void ShutdownGamescope();
+
+// A selected plugin either upscales or stops gamescope with the reason; it never hands frames to
+// another upscaler, so what is on screen is always what was asked for.
+[[gnu::format( printf, 1, 2 )]] static void ext_fail( const char *pszFormat, ... )
+{
+	if ( g_bExternalUpscalerFailed )
+		return;
+	char szReason[512];
+	va_list args;
+	va_start( args, pszFormat );
+	vsnprintf( szReason, sizeof( szReason ), pszFormat, args );
+	va_end( args );
+	vk_log.errorf( "external upscaler \"%s\": %s; stopping (a selected upscaler never falls back to another one)",
+		g_sExternalUpscalerSpec.c_str(), szReason );
+	g_bExternalUpscalerFailed = true;
+	ShutdownGamescope();
+}
+
 static bool ext_negotiate( uint32_t inW, uint32_t inH, uint32_t outW, uint32_t outH, bool bHDR )
 {
 	gs_upscaler_negotiate_desc_t desc = {};
@@ -4632,23 +4653,24 @@ static bool ext_negotiate( uint32_t inW, uint32_t inH, uint32_t outW, uint32_t o
 	desc.in_w = inW; desc.in_h = inH;
 	desc.out_w = outW; desc.out_h = outH;
 	desc.colorspace = GS_UPSCALER_COLORSPACE_SRGB;
-	// The frame-build gate (useExternalLayer0 in steamcompmgr.cpp) already keeps an HDR layer out of
-	// this path, so bHDR is expected false here -- carried through for real (not hardcoded) so a
-	// v1 plugin's own decline still holds if a future caller skips that gate.
 	desc.hdr = bHDR;
 	desc.sharpness = float( g_upscaleFilterSharpness );
 	if ( !EU::Negotiate( desc, s_ext.negotiation ) )
+	{
+		ext_fail( "declined %ux%u -> %ux%u%s", inW, inH, outW, outH, bHDR ? " (HDR)" : "" );
 		return false;
+	}
 	if ( !s_ext.negotiation.scale_num || !s_ext.negotiation.scale_den )
 	{
-		vk_log.infof( "external: plugin accepted with scale %u/%u", s_ext.negotiation.scale_num, s_ext.negotiation.scale_den );
+		ext_fail( "accepted %ux%u -> %ux%u with an unusable scale %u/%u", inW, inH, outW, outH,
+			s_ext.negotiation.scale_num, s_ext.negotiation.scale_den );
 		return false;
 	}
 
 	bool bModifierMismatch = false;
 	if ( !ExtPickFormat( s_ext.negotiation, s_ext.mode, bModifierMismatch ) )
 	{
-		vk_log.infof( "external: plugin accepted the size but %s (%u format(s) offered)",
+		ext_fail( "accepted the size but %s (%u format(s) offered)",
 			bModifierMismatch ? "only offered a non-linear modifier gamescope can't produce" : "none of its formats is a plane gamescope can serve",
 			s_ext.negotiation.format_count );
 		return false;
@@ -4661,18 +4683,9 @@ static bool ext_update_images( uint32_t inW, uint32_t inH, uint32_t outW, uint32
 {
 	if ( s_ext.pIn[0] && s_ext.inW == inW && s_ext.inH == inH && s_ext.outW == outW && s_ext.outH == outH )
 		return true;
-	// A decline holds until the sizes change; asking again every frame only repeats it.
-	static std::array<uint32_t, 5> s_declined = {};
-	const std::array<uint32_t, 5> key = { inW, inH, outW, outH, bHDR };
-	if ( key == s_declined )
-		return false;
 	ExtDrainAll();
 	if ( !ext_negotiate( inW, inH, outW, outH, bHDR ) )
-	{
-		s_declined = key;
 		return false;
-	}
-	s_declined = {};
 
 	// Linear, not whatever RADV would prefer for perf: cross-device import (the ABI's second-device
 	// case) can't assume a plugin understands this GPU's tiled modifier, and negotiate()'s answer
@@ -4698,7 +4711,10 @@ static bool ext_update_images( uint32_t inW, uint32_t inH, uint32_t outW, uint32
 		{
 			if ( !s_ext.pIn[i]->BInit( inW, inH, 1u, DRM_FORMAT_ARGB8888, inFlags ) ||
 			     !s_ext.pOut[i]->BInit( outW, outH, 1u, DRM_FORMAT_ARGB8888, outFlags ) )
+			{
+				ext_fail( "could not allocate the %ux%u -> %ux%u exchange images", inW, inH, outW, outH );
 				return false;
+			}
 		}
 		else // Y8Nv12Padded
 		{
@@ -4706,11 +4722,14 @@ static bool ext_update_images( uint32_t inW, uint32_t inH, uint32_t outW, uint32
 			yOutFlags.bStorage = true; // the plugin writes plane 0 (Y) directly, not sampled from
 			if ( !s_ext.pIn[i]->BInit( s_ext.inPadW, s_ext.inPadH, 1u, DRM_FORMAT_R8, inFlags ) ||
 			     !s_ext.pOut[i]->BInit( s_ext.outPadW, s_ext.outPadH, 1u, DRM_FORMAT_NV12, yOutFlags ) )
+			{
+				ext_fail( "could not allocate the %ux%u -> %ux%u exchange images", s_ext.inPadW, s_ext.inPadH, s_ext.outPadW, s_ext.outPadH );
 				return false;
+			}
 		}
 		if ( s_ext.pIn[i]->dmabuf().n_planes != 1 || s_ext.pOut[i]->dmabuf().n_planes != 1 )
 		{
-			vk_log.errorf( "external: exported textures are not single-plane" );
+			ext_fail( "the exchange images were exported with more than one plane" );
 			return false;
 		}
 	}
@@ -4838,7 +4857,7 @@ static bool ExtSubmitSlot( int i, gamescope::Rc<CVulkanTexture> pTex, std::chron
 	upscale_trace( ulId, "submitted", trace_ns( tReturned ) );
 	if ( nFence == -2 )
 	{
-		vk_log.errorf( "external: submit() hard-failed, falling back to FSR" );
+		ext_fail( "submit() failed" );
 		s_ext.bLoaded = false;
 		return false;
 	}
@@ -4909,13 +4928,20 @@ static bool ExtResultPending( const CVulkanTexture *pLayer0 )
 
 static bool vulkan_external_upscale_layer0( struct FrameInfo_t *frameInfo, CVulkanCmdBuffer *cmdBuffer, gamescope::Rc<CVulkanTexture> compositeImage, EOTF outputTF )
 {
-	if ( frameInfo->ycbcrMask() & 1 )
+	if ( g_bExternalUpscalerFailed )
 		return false;
+	if ( frameInfo->ycbcrMask() & 1 )
+	{
+		ext_fail( "layer 0 is a YCbCr (video) surface, which the plugin interface does not carry" );
+		return false;
+	}
 	if ( !s_ext.bTriedLoad )
 	{
 		s_ext.bTriedLoad = true;
 		s_ext.bLoaded = EU::Load( g_sExternalUpscalerSpec, g_sExternalUpscalerConfig );
 		s_ext.windowStart = std::chrono::steady_clock::now();
+		if ( !s_ext.bLoaded )
+			ext_fail( "could not be loaded (the line above says why)" );
 	}
 	if ( !s_ext.bLoaded )
 		return false;
@@ -5123,7 +5149,7 @@ std::optional<uint64_t> vulkan_composite( struct FrameInfo_t *frameInfo, gamesco
 	if ( frameInfo->useExternalLayer0 && vulkan_external_upscale_layer0( frameInfo, cmdBuffer.get(), compositeImage, outputTF ) )
 	{
 	}
-	else if ( frameInfo->useFSRLayer0 || frameInfo->useSGSRLayer0 || frameInfo->useExternalLayer0 )
+	else if ( frameInfo->useFSRLayer0 || frameInfo->useSGSRLayer0 )
 	{
 		uint32_t inputX = frameInfo->layers.get( 0 ).tex->width();
 		uint32_t inputY = frameInfo->layers.get( 0 ).tex->height();

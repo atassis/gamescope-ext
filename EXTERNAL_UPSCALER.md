@@ -30,13 +30,18 @@ plugin is its own meson project and builds against either.
 2. **Negotiation**: `negotiate(in/out size, colorspace, hdr)` accepts or declines, and lists up to 8
    input formats, most preferred first: plane kind, DRM fourcc, modifier, edge padding, alignment
    and the full padded plane sizes. The host serves unpadded BGRA8, or a padded Y8 plane in with
-   NV12 out, and only at `DRM_FORMAT_MOD_LINEAR`. A decline is a normal outcome: the host falls
-   back to its built-in FSR1 and does not ask again until the sizes change. HDR layers never reach
-   a plugin.
+   NV12 out, and only at `DRM_FORMAT_MOD_LINEAR`. A plugin that cannot reach the shown size
+   exactly may accept a smaller `scale_num/scale_den`; the host stretches its output the rest of
+   the way. HDR layers are offered like any other, with `hdr` set.
 3. **Async submit**: `submit(in dmabuf, out dmabuf, in_fence_fd) -> out_fence_fd`. The readback
    reaches the plugin as a sync_file `in_fence_fd`. `-1` means the output is already written;
-   `-2` is a hard failure (fall back).
+   `-2` is a hard failure.
 4. **Lifecycle**: `create`/`destroy`, and `negotiate()` again at any time, e.g. on a layer resize.
+
+A selected plugin is never replaced by another upscaler. When it cannot be found, gamescope does not
+start; when it declines, fails `submit()`, or the host cannot serve it (a YCbCr layer, no plane it
+can produce, allocation failure), gamescope logs the plugin, the sizes and the reason, and exits
+with status 1.
 
 The host submits at commit time into one of four input/output slot pairs, at most two in flight,
 and composites the newest finished result.

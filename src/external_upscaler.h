@@ -101,9 +101,10 @@ typedef struct gs_upscaler_format_t
 	uint32_t out_padded_w, out_padded_h; // full padded OUTPUT plane size gamescope must allocate, or 0
 } gs_upscaler_format_t;
 
-// Plugin's answer, written in place by negotiate(). accepted=false means gamescope falls back to
-// its own GPU FSR path (or "linear" if FSR was already the user's choice) -- this is always a
-// valid, silent outcome, not an error.
+// Plugin's answer, written in place by negotiate(). accepted=false stops gamescope with the sizes
+// in its log: a selected plugin is never replaced by another upscaler. A plugin that cannot reach
+// out_w x out_h exactly may accept with a smaller scale; gamescope stretches its output the rest of
+// the way to the shown size.
 typedef struct gs_upscaler_negotiate_result_t
 {
 	uint32_t size;
@@ -187,8 +188,7 @@ typedef struct gs_upscaler_api_t
 	                      gs_upscaler_negotiate_result_t *out_result );
 
 	// Valid only after an accepted negotiate(); async, see gs_upscaler_submit_t above. Returns a
-	// sync_file fd or -1. -2 signals a hard failure (device lost, etc.) -- gamescope falls back to
-	// GPU FSR for subsequent frames and may retry create() later.
+	// sync_file fd or -1. -2 signals a hard failure (device lost, etc.) and stops gamescope.
 	int ( *submit )( gs_upscaler_instance *inst, const gs_upscaler_submit_t *submit );
 } gs_upscaler_api_t;
 

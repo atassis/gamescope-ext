@@ -255,7 +255,7 @@ namespace gamescope::ExternalUpscaler
 		s_pApi->negotiate( s_pInstance, &desc, &out );
 		s_lastResult = out;
 		if ( !out.accepted )
-			ext_log.infof( "plugin declined %ux%u -> %ux%u, using GPU FSR", desc.in_w, desc.in_h, desc.out_w, desc.out_h );
+			ext_log.infof( "plugin declined %ux%u -> %ux%u", desc.in_w, desc.in_h, desc.out_w, desc.out_h );
 		return out.accepted;
 	}
 

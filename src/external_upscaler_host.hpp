@@ -34,13 +34,13 @@ namespace gamescope::ExternalUpscaler
 	bool Loaded();
 
 	// Re-negotiates for a new size/colorspace; safe to call repeatedly (layer resize). Returns
-	// false when the plugin declines -- the caller falls back to GPU FSR.
+	// false when the plugin declines.
 	bool Negotiate( const gs_upscaler_negotiate_desc_t &desc, gs_upscaler_negotiate_result_t &out );
 
 	const gs_upscaler_negotiate_result_t &LastNegotiation();
 	gs_upscaler_device_info_t DeviceInfo();
 
 	// Async submit; returns the out-fence fd (caller closes it) or -1 (out already ready) or -2
-	// (hard failure -- caller should fall back).
+	// (hard failure).
 	int Submit( const gs_upscaler_submit_t &submit );
 }

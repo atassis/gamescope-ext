@@ -24,7 +24,8 @@ reference plugin, FSR1 on a Vulkan device of your choice, and an installer for i
 
     gamescope-ext -w 1280 -h 800 -W 2560 -H 1600 -F external:<plugin>[:config] -- %command%
 
-If a plugin declines the sizes, or fails to load, the frame is upscaled with the built-in FSR1.
+A selected plugin is never replaced by another upscaler: if it is missing, gamescope does not start,
+and if it declines a size or fails, gamescope stops and logs why.
 
 `gamescope-ext-run` builds that command line from a named profile in
 `~/.config/gamescope-ext/run.conf`, so Steam's launch options stay short and carry no paths. The

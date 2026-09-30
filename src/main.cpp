@@ -23,6 +23,7 @@
 #include <climits>
 
 #include "main.hpp"
+#include "external_upscaler_host.hpp"
 #include "steamcompmgr.hpp"
 #include "rendervulkan.hpp"
 #include "wlserver.hpp"
@@ -886,6 +887,18 @@ int main(int argc, char **argv)
 		}
 	}
 
+	// A selected plugin that cannot be found stops gamescope here, before the game starts, rather
+	// than at the first frame (see ext_fail in rendervulkan.cpp).
+	if ( g_wantedUpscaleFilter == GamescopeUpscaleFilter::EXTERNAL )
+	{
+		gamescope::ExternalUpscaler::PluginManifest manifest;
+		if ( !gamescope::ExternalUpscaler::Resolve( g_sExternalUpscalerSpec, manifest ) )
+		{
+			fprintf( stderr, "gamescope: -F external:%s: no usable plugin (see above); not starting\n", g_sExternalUpscalerSpec.c_str() );
+			return 1;
+		}
+	}
+
 	// Steam preloads its overlay into us, but only the SDL backend can draw it.
 	// A ConVar or script override comes too late to unload it.
 	gamescope::GamescopeBackend eLaunchBackend = eCurrentBackend;
@@ -1134,6 +1147,9 @@ int main(int argc, char **argv)
 
 	gamescope::Process::KillAllChildren( getpid(), SIGTERM );
 	gamescope::Process::WaitForAllChildren();
+
+	extern bool g_bExternalUpscalerFailed;
+	return g_bExternalUpscalerFailed ? 1 : 0;
 }
 
 static void steamCompMgrThreadRun(int argc, char **argv)
