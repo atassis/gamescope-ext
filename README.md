@@ -1,3 +1,37 @@
+## About this fork
+
+This is gamescope 3.16.31 with one addition: the upscale pass can be handed to a separately
+installed plugin, for example one that runs it on an NPU or on a second GPU. The compositor itself
+contains no device-specific code; each plugin carries its own and checks for its hardware when it
+is installed. The plugin ABI and how plugins are found are described in
+[EXTERNAL_UPSCALER.md](EXTERNAL_UPSCALER.md).
+
+It installs under its own name (default `gamescope-ext`) with its own Vulkan WSI layer
+(`VK_LAYER_gamescope_ext_wsi`, enabled by `ENABLE_GAMESCOPE_EXT_WSI`), so it can sit next to a system
+gamescope without either one loading the other's layer.
+
+### Install
+
+    ./install.sh                  # builds, installs to ~/.local; --prefix DIR, --name NAME
+    ./uninstall.sh                # removes exactly what install.sh recorded
+
+Then install the plugins you have hardware for. Plugins are separate projects: each has its own
+installer, which checks for its hardware and builds against the ABI header and pkg-config file
+installed above.
+
+### Run
+
+    gamescope-ext -w 1280 -h 800 -W 2560 -H 1600 -F external:<plugin>[:config] -- %command%
+
+If a plugin declines the sizes, or fails to load, the frame is upscaled with the built-in FSR1.
+
+### Licence
+
+The compositor keeps upstream's BSD 2-Clause licence (`LICENSE`), including the plugin ABI header.
+Plugins carry their own licences.
+
+---
+
 ## gamescope: the micro-compositor formerly known as steamcompmgr
 
 In an embedded session usecase, gamescope does the same thing as steamcompmgr, but with less extra copies and latency:
